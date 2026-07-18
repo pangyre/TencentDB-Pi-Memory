@@ -2,7 +2,9 @@
  * Simple file-backed logger for the pi memory extension.
  *
  * - All levels append to `<dataDir>/logs/pi-extension.log` (best-effort).
- * - warn/error always echo to console; debug echoes only when PI_MEMORY_DEBUG is set.
+ * - warn/error echo to stderr only on a TTY (or when PI_MEMORY_DEBUG is set), so
+ *   headless pi runs (print mode, roborev, RPC consumers) stay clean.
+ * - debug echoes only when PI_MEMORY_DEBUG is set.
  * - Never throws.
  */
 
@@ -27,6 +29,9 @@ export function createLogger(dataDir: string): Logger {
     }
   };
 
+  const echoAllowed = (): boolean =>
+    Boolean(process.env.PI_MEMORY_DEBUG) || Boolean(process.stderr.isTTY);
+
   return {
     debug(msg: string): void {
       writeLine("DEBUG", msg);
@@ -39,11 +44,11 @@ export function createLogger(dataDir: string): Logger {
     },
     warn(msg: string): void {
       writeLine("WARN", msg);
-      console.error(`[memory-tdai] warn: ${msg}`);
+      if (echoAllowed()) console.error(`[memory-tdai] warn: ${msg}`);
     },
     error(msg: string): void {
       writeLine("ERROR", msg);
-      console.error(`[memory-tdai] error: ${msg}`);
+      if (echoAllowed()) console.error(`[memory-tdai] error: ${msg}`);
     },
   };
 }
