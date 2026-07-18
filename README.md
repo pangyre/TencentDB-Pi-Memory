@@ -383,6 +383,30 @@ memory:
   provider: memory_tencentdb
 ```
 
+### 4. Pi coding agent
+
+The repo doubles as a [pi](https://github.com/badlogic/pi-mono) package: the
+`pi` manifest in `package.json` points pi at `pi-extension/index.ts`, which
+wires the same host-neutral core (`TdaiCore`) into pi's extension API —
+auto-recall into the per-turn system prompt, auto-capture on `agent_end`,
+`tdai_memory_search` / `tdai_conversation_search` tools, a `/memory` command,
+and the symbolic short-term memory / context-offload pipeline (opt-in).
+
+```bash
+# from git (pi runs npm install for you)
+pi install git:github.com/nicwn/TencentDB-Pi-Memory
+
+# or from a local checkout
+cd /path/to/TencentDB-Agent-Memory && npm install
+pi install /path/to/TencentDB-Agent-Memory
+```
+
+All pi agents share one global store at `~/.pi/agent/memory-tdai/`
+(config: `config.json` in that directory; per-project overlay:
+`<project>/.pi/memory-tdai.json`). Everything works zero-config; add LLM +
+embedding endpoints to enable the full L1/L2/L3 pipeline. See
+[`pi-extension/README.md`](./pi-extension/README.md) for details.
+
 
 ## 🔒 Gateway Security (optional)
 

@@ -40,21 +40,49 @@ All pi agents (one per project directory) share **one global store** at
 
 ## Install
 
-1. Install repo dependencies (once):
+The repo is a **pi package**: `package.json` carries a `pi` manifest
+(`"pi": { "extensions": ["./pi-extension/index.ts"] }`), so pi discovers the
+extension automatically from any of the install methods below. Pi loads the
+TypeScript directly — no build step.
 
-   ```bash
-   cd /home/nick/TencentDB-Agent-Memory && npm install
-   ```
+### Option A — install from git (recommended for sharing)
 
-2. Register the extension in `~/.pi/agent/settings.json`:
+```bash
+pi install git:github.com/nicwn/TencentDB-Pi-Memory
+# or pinned: pi install git:github.com/nicwn/TencentDB-Pi-Memory@<tag-or-commit>
+```
 
-   ```json
-   {
-     "extensions": ["/home/nick/TencentDB-Agent-Memory/pi-extension/index.ts"]
-   }
-   ```
+pi clones the repo under `~/.pi/agent/git/` and runs `npm install` for you.
+Use `-l` to install into the project's `.pi/settings.json` instead of the
+global settings, or try it once without installing:
 
-3. Start a new pi session (or `/reload`). `/memory` should show status.
+```bash
+pi -e git:github.com/nicwn/TencentDB-Pi-Memory
+```
+
+### Option B — install from a local checkout
+
+```bash
+cd /path/to/TencentDB-Agent-Memory && npm install   # once
+pi install /path/to/TencentDB-Agent-Memory
+```
+
+### Option C — register the extension file manually
+
+Add the entry file to `~/.pi/agent/settings.json` (after `npm install` in the
+repo):
+
+```json
+{
+  "extensions": ["/path/to/TencentDB-Agent-Memory/pi-extension/index.ts"]
+}
+```
+
+Then start a new pi session (or `/reload`). `/memory` should show status.
+
+> Note: the repo's npm `postinstall` hook only applies an OpenClaw runtime
+> patch when OpenClaw is present; on a pi-only machine it logs a skip and does
+> nothing.
 
 ## Configuration
 

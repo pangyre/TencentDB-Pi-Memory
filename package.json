@@ -48,6 +48,8 @@
     "scripts/setup-offload.sh",
     "hermes-plugin/",
     "openclaw.plugin.json",
+    "pi-extension/",
+    "!pi-extension/CONTRACT.md",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
@@ -67,10 +69,18 @@
     "conversation",
     "persona",
     "scene-extraction",
-    "embedding"
+    "embedding",
+    "pi-package"
   ],
   "author": "TencentDB Agent Memory Team",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nicwn/TencentDB-Pi-Memory.git"
+  },
+  "pi": {
+    "extensions": ["./pi-extension/index.ts"]
+  },
   "engines": {
     "node": ">=22.16.0"
   },
@@ -91,10 +101,18 @@
     "opik": "^1.0.0"
   },
   "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
     "node-llama-cpp": "^3.16.2",
-    "openclaw": ">=2026.3.7"
+    "openclaw": ">=2026.3.7",
+    "typebox": "*"
   },
   "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    },
     "openclaw": {
       "optional": true
     },
