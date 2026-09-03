@@ -473,70 +473,87 @@ export class TdaiCore {
         void (async () => {
           const lockPath = path.join(this.dataDir, "reindex.lock");
 
-          // D4: acquire an exclusive lock or skip (another process is doing
-          // it). Staleness: if the lock owner's pid is dead (process crashed
-          // or was killed), steal the lock so a future boot can retry —
-          // otherwise a stale lock would block reindexing forever.
+          // D4: single-flight reindex across pi processes sharing the global
+          // store. Atomic acquisition: create a UNIQUE temp file, then link()
+          // it onto the lock path — link(2) is atomic and fails EEXIST if the
+          // lock exists, so two processes can never both hold it (no
+          // unlink-then-create TOCTOU). Steal rules: the lock owner embeds a
+          // random nonce; on takeover we write our own and re-verify ours is
+          // the one on disk. A lock older than 30 minutes is stolen outright
+          // (a reindex takes minutes; 30 min covers pid-recycle and NFS
+          // pid-namespace cases where liveness checks are unreliable).
+          const LOCK_STALE_MS = 30 * 60 * 1000;
+          const myNonce = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+          const readLockOwner = (): { nonce?: string; ts?: number } | null => {
+            try {
+              return JSON.parse(fs.readFileSync(lockPath, "utf8")) as { nonce?: string; ts?: number };
+            } catch {
+              return null; // vanished between operations — treat as free
+            }
+          };
+
+          const tryAcquire = (): boolean => {
+            const tmpPath = `${lockPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+            try {
+              fs.writeFileSync(tmpPath, JSON.stringify({ nonce: myNonce, pid: process.pid, ts: Date.now() }));
+              // Atomic create-or-fail: link(2) refuses to clobber an existing
+              // lock, so exactly one contender wins.
+              fs.linkSync(tmpPath, lockPath);
+              return true;
+            } catch (err) {
+              const code = (err as NodeJS.ErrnoException).code;
+              if (code !== "EEXIST") {
+                this.logger?.warn?.(
+                  `${TAG} Reindex lock acquisition error (${code ?? "unknown"}): treating as not-acquired.`,
+                );
+              }
+              return false;
+            } finally {
+              try { fs.unlinkSync(tmpPath); } catch { /* temp already gone */ }
+            }
+          };
+
+          const stealStaleLock = (): boolean => {
+            // Replace whatever is on disk with our lock, then verify OUR
+            // nonce survived — if a faster process replaced ours, it won.
+            try {
+              const fd = fs.openSync(lockPath, "w");
+              fs.writeSync(fd, JSON.stringify({ nonce: myNonce, pid: process.pid, ts: Date.now() }));
+              fs.closeSync(fd);
+            } catch {
+              return false;
+            }
+            const now = readLockOwner();
+            return now?.nonce === myNonce;
+          };
+
           const acquireLock = (): boolean => {
             try {
               fs.mkdirSync(path.dirname(lockPath), { recursive: true });
             } catch { /* ignore */ }
-            try {
-              const fd = fs.openSync(lockPath, "wx");
-              fs.writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
-              fs.closeSync(fd);
-              return true;
-            } catch {
-              // Lock exists — is the owner alive?
-            try {
-              const raw = fs.readFileSync(lockPath, "utf8");
-              const owner = JSON.parse(raw) as { pid?: number; ts?: number };
-              // L2 backstop: a lock older than 30 min is stale regardless of
-              // pid liveness (pid recycling can make a dead owner look alive;
-              // a reindex takes minutes, not half an hour).
-              if (typeof owner.ts === "number" && Date.now() - owner.ts > 30 * 60 * 1000) {
-                this.logger?.info?.(`${TAG} Reindex lock older than 30min — stealing.`);
-                try { fs.unlinkSync(lockPath); } catch { /* raced */ }
-                try {
-                  const fd = fs.openSync(lockPath, "wx");
-                  fs.writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
-                  fs.closeSync(fd);
-                  return true;
-                } catch {
-                  return false;
-                }
-              }
-              if (typeof owner.pid === "number" && owner.pid > 0) {
-                  try {
-                    process.kill(owner.pid, 0); // throws ESRCH if dead
-                    return false; // owner alive — they are reindexing
-                  } catch {
-                    // ESRCH → owner dead → steal
-                    try { fs.unlinkSync(lockPath); } catch { /* raced */ }
-                    try {
-                      const fd = fs.openSync(lockPath, "wx");
-                      fs.writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
-                      fs.closeSync(fd);
-                      return true;
-                    } catch {
-                      return false; // another process stole it first
-                    }
-                  }
-                }
-                // Malformed lock with no pid — stale by definition; steal.
-                try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
-                try {
-                  const fd = fs.openSync(lockPath, "wx");
-                  fs.writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
-                  fs.closeSync(fd);
-                  return true;
-                } catch {
-                  return false;
-                }
-              } catch {
-                return false; // cannot read lock — do not fight over it
-              }
+
+            if (tryAcquire()) return true;
+
+            // Lock exists — check staleness.
+            const owner = readLockOwner();
+            const age = owner?.ts ? Date.now() - owner.ts : Infinity;
+            if (age > LOCK_STALE_MS) {
+              this.logger?.info?.(
+                `${TAG} Reindex lock stale (age ${Math.round(age / 60000)}min) — stealing.`,
+              );
+              return stealStaleLock();
             }
+            return false; // held by a live recent owner — skip
+          };
+
+          const releaseLock = (): void => {
+            // Only remove the lock if WE still own it (nonce check) — never
+            // clobber a successor's lock.
+            try {
+              const owner = readLockOwner();
+              if (owner?.nonce === myNonce) fs.unlinkSync(lockPath);
+            } catch { /* best-effort */ }
           };
 
           if (!acquireLock()) {
@@ -545,10 +562,6 @@ export class TdaiCore {
             );
             return;
           }
-
-          const releaseLock = () => {
-            try { fs.unlinkSync(lockPath); } catch { /* best-effort */ }
-          };
 
           try {
             // D3: local providers must be warm before embed() works.
@@ -560,7 +573,7 @@ export class TdaiCore {
                 if (Date.now() > readyAt) {
                   this.logger?.warn?.(
                     `${TAG} Embedding service not ready after 5min — aborting reindex. ` +
-                      `Meta left stale; next boot will retry.`,
+                      `Tables left frozen (nothing destroyed); meta stays stale; next boot will retry.`,
                   );
                   return;
                 }
@@ -581,9 +594,11 @@ export class TdaiCore {
 
             const result = await vs.reindexAll(
               async (text) => es.embed(text),
-              (done, totalCount, layer) => {
-                if (done === 1 || done % 500 === 0 || done === totalCount) {
-                  this.logger?.info?.(`${TAG} reindex progress: ${layer} ${done}/${totalCount}`);
+              (succeeded, failed, totalCount, layer) => {
+                if (succeeded === 1 || succeeded % 500 === 0 || succeeded + failed === totalCount) {
+                  this.logger?.info?.(
+                    `${TAG} reindex progress: ${layer} ${succeeded} ok / ${failed} failed / ${totalCount} total`,
+                  );
                 }
               },
             );

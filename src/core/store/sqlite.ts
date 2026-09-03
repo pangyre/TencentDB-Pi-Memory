@@ -1933,7 +1933,7 @@ export class VectorStore implements IMemoryStore {
    */
   async reindexAll(
     embedFn: (text: string) => Promise<Float32Array>,
-    onProgress?: (done: number, total: number, layer: "L1" | "L0") => void,
+    onProgress?: (succeeded: number, failed: number, total: number, layer: "L1" | "L0") => void,
   ): Promise<{
     l1Count: number;
     l0Count: number;
@@ -1972,7 +1972,7 @@ export class VectorStore implements IMemoryStore {
             `${TAG} reindex L1 skip ${record_id} (${l1Failed}): ${err instanceof Error ? err.message : String(err)}`,
           );
         }
-        onProgress?.(l1Done + l1Failed, l1Rows.length, "L1");
+        onProgress?.(l1Done, l1Failed, l1Rows.length, "L1");
       }
 
       // ── Re-embed L0 ──
@@ -1999,7 +1999,7 @@ export class VectorStore implements IMemoryStore {
             `${TAG} reindex L0 skip ${record_id} (${l0Failed}): ${err instanceof Error ? err.message : String(err)}`,
           );
         }
-        onProgress?.(l0Done + l0Failed, l0Rows.length, "L0");
+        onProgress?.(l0Done, l0Failed, l0Rows.length, "L0");
       }
 
       this.logger?.info(

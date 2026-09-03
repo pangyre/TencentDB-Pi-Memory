@@ -1161,7 +1161,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
 
   async reindexAll(
     _embedFn: (text: string) => Promise<Float32Array>,
-    _onProgress?: (done: number, total: number, layer: "L1" | "L0") => void,
+    _onProgress?: (succeeded: number, failed: number, total: number, layer: "L1" | "L0") => void,
   ): Promise<{
     l1Count: number;
     l0Count: number;

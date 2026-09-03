@@ -66,10 +66,10 @@ const result = await vs.reindexAll(
     const emb = await es.embed(text);
     return emb;
   },
-  (done: number, total: number, layer: "L1" | "L0") => {
-    if (done === 1 || done % 250 === 0 || done === total) {
-      const pct = ((done / total) * 100).toFixed(0);
-      console.log(`  ${layer}: ${done}/${total} (${pct}%)`);
+  (succeeded: number, failed: number, total: number, layer: "L1" | "L0") => {
+    if (succeeded === 1 || succeeded % 250 === 0 || succeeded + failed === total) {
+      const pct = (((succeeded + failed) / total) * 100).toFixed(0);
+      console.log(`  ${layer}: ${succeeded} ok / ${failed} failed / ${total} total (${pct}%)`);
     }
   },
 );
