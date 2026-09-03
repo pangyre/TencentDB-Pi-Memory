@@ -410,6 +410,55 @@ export class TdaiCore {
       this.vectorStore = stores.vectorStore;
       this.embeddingService = stores.embeddingService;
       this.logger.debug?.(`${TAG} Stores initialized: backend=${this.cfg.storeBackend}, embedding=${this.cfg.embedding.provider}`);
+
+      // Embedding config changed (provider / model / dimensions) — the store
+      // dropped and rebuilt its vector tables at the new width; the texts are
+      // NOT yet embedded. Fire a one-time background reindex so semantic
+      // search has vectors to search. Only fires when the persisted
+      // embedding_meta differs from current config — steady-state boots skip
+      // this entirely (a single metadata compare, no embed cost).
+      if (stores.needsReindex && this.vectorStore && this.embeddingService) {
+        const vs = this.vectorStore;
+        const es = this.embeddingService;
+        const reason = stores.reindexReason ?? "embedding config changed";
+        this.logger?.info(
+          `${TAG} ${reason}; re-embedding all stored texts in the background ` +
+            `(L1 + L0 through ${this.cfg.embedding.provider}/${this.cfg.embedding.model ?? es.getProviderInfo().model})...`,
+        );
+        // Deliberately not awaited: boot must not block on a full re-embed.
+        // Rows are embedded one at a time; each failure is skipped and logged
+        // by reindexAll (non-fatal). Keyword/FTS recall remains available
+        // while the background pass runs.
+        void (async () => {
+          try {
+            const before = await es.embed("reindex warmup");
+            void before;
+          } catch { /* warmup is best-effort */ }
+          try {
+            const result = await vs.reindexAll(
+              async (text) => {
+                const emb = await es.embed(text);
+                return emb;
+              },
+              (done, totalCount, layer) => {
+                if (done === 1 || done % 500 === 0 || done === totalCount) {
+                  this.logger?.info?.(
+                    `${TAG} reindex progress: ${layer} ${done}/${totalCount}`,
+                  );
+                }
+              },
+            );
+            this.logger?.info(
+              `${TAG} Background reindex complete: L1=${result.l1Count}, L0=${result.l0Count}`,
+            );
+          } catch (err) {
+            this.logger?.warn(
+              `${TAG} Background reindex failed (non-fatal; keyword recall unaffected): ` +
+                `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        })();
+      }
     } catch (err) {
       this.logger.warn(
         `${TAG} Store init failed; recall/dedup degraded: ${err instanceof Error ? err.message : String(err)}`,
