@@ -153,8 +153,7 @@ export interface ReindexConfig {
   approveChanges: boolean;
 }
 
-/**
- * Daily cleaner settings for local JSONL data (L0/L1). */
+/** Daily cleaner settings for local JSONL data (L0/L1). */
 export interface MemoryCleanupConfig {
   /** TTL switch from capture.l0l1RetentionDays. Undefined means disabled. */
   retentionDays?: number;

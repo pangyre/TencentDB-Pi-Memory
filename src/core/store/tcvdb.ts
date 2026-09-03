@@ -1162,11 +1162,18 @@ export class TcvdbMemoryStore implements IMemoryStore {
   async reindexAll(
     _embedFn: (text: string) => Promise<Float32Array>,
     _onProgress?: (done: number, total: number, layer: "L1" | "L0") => void,
-  ): Promise<{ l1Count: number; l0Count: number; l1Failed: number; l0Failed: number }> {
+  ): Promise<{
+    l1Count: number;
+    l0Count: number;
+    l1Failed: number;
+    l0Failed: number;
+    l1Total: number;
+    l0Total: number;
+  }> {
     // TCVDB uses server-side embedding — reindex means rebuild Collection.
     // Not implemented in Phase 2-3 (requires drop + recreate + re-upsert from JSONL).
     this.logger?.info(`${TAG} reindexAll: TCVDB uses server-side embedding, skipping`);
-    return { l1Count: 0, l0Count: 0, l1Failed: 0, l0Failed: 0 };
+    return { l1Count: 0, l0Count: 0, l1Failed: 0, l0Failed: 0, l1Total: 0, l0Total: 0 };
   }
 
   markEmbeddingCurrent(_providerInfo: EmbeddingProviderInfo): void {

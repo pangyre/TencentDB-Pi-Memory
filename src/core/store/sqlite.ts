@@ -351,9 +351,22 @@ export class VectorStore implements IMemoryStore {
   /**
    * `true` when vec0 virtual tables (l1_vec / l0_vec) have been created and
    * their prepared statements are ready.  When `dimensions === 0` (i.e.
-   * provider="none"), vec0 tables are deferred and this stays `false`.
+   * provider="none") OR a reindex is pending (provider changed; rebuild
+   * deferred until approved), this stays `false` — vector search and vec
+   * writes skip, keyword/FTS recall is unaffected.
    */
   private vecTablesReady = false;
+
+  /**
+   * `true` when an embedding config change was detected but the vector
+   * tables have not been rebuilt yet (waiting on reindex.approveChanges or
+   * a completed reindex). The old vec tables are left intact on disk —
+   * nothing is destroyed until the approved rebuild runs. While pending,
+   * vector search/write skip (vecTablesReady=false) and `rebuildVecTables()`
+   * performs the drop+recreate at the new dimensions.
+   */
+  private reindexPending = false;
+  private reindexPendingReason: string | undefined;
 
   // Prepared statements — L1 (initialized in init())
   private stmtUpsertMeta!: StatementSync;
@@ -496,6 +509,15 @@ export class VectorStore implements IMemoryStore {
     // Detect whether re-index is needed
     let needsReindex = false;
     let reindexReason: string | undefined;
+    // Reindex pending: a provider/model/dimension change was detected but the
+    // rebuild has NOT run (waiting on reindex.approveChanges, or a reindex
+    // that failed/crashed). While pending, the existing vector tables are
+    // FROZEN — left on disk untouched, vecTablesReady stays false so vector
+    // search and vec writes skip — and the approved reindex performs the
+    // drop+rebuild. Deferring the drop here is deliberate: a config typo or
+    // experiment must not destroy the vector index (revert the config and
+    // the old vectors are still valid — nothing was destroyed).
+    this.reindexPending = false;
 
     const savedMeta = this.readEmbeddingMeta();
 
@@ -514,16 +536,15 @@ export class VectorStore implements IMemoryStore {
 
           this.logger?.info(
             `${TAG} Embedding config changed (${reindexReason}). ` +
-            `Dropping vector tables for rebuild...`,
+            `Vector tables left intact; rebuild deferred until the reindex runs ` +
+            `(reindex.approveChanges).`,
           );
-
-          // Drop and re-create vector tables with new dimensions
-          this.dropVectorTables();
           needsReindex = true;
+          this.reindexPending = true;
         }
       } else {
         // No saved meta — first run or legacy DB without meta table.
-        // Two cases require dropping vector tables:
+        // Two cases require a rebuild:
         // 1. Existing data created without meta tracking (legacy DB) — need re-embed
         // 2. vec0 tables exist with wrong dimensions (e.g. previously created with
         //    provider="none" placeholder 768D, now switching to a real provider
@@ -535,21 +556,21 @@ export class VectorStore implements IMemoryStore {
         if (l1Count > 0 || l0Count > 0) {
           this.logger?.info(
             `${TAG} No embedding_meta found but existing data exists ` +
-            `(L1=${l1Count}, L0=${l0Count}). Dropping vector tables for safety...`,
+            `(L1=${l1Count}, L0=${l0Count}). Rebuild deferred until the reindex runs...`,
           );
-          this.dropVectorTables();
           needsReindex = true;
+          this.reindexPending = true;
           reindexReason = "legacy DB without embedding_meta — cannot verify vector compatibility";
         } else if (existingVecDims !== null && existingVecDims !== this.dimensions) {
           // vec0 tables exist (from a previous provider="none" placeholder or
-          // different config) but with mismatched dimensions.  Drop them so they
-          // get re-created with the correct dimensions below.
+          // different config) but with mismatched dimensions.
           this.logger?.info(
             `${TAG} vec0 table dimension mismatch (existing=${existingVecDims}, ` +
-            `required=${this.dimensions}). Dropping vector tables for rebuild...`,
+            `required=${this.dimensions}). Rebuild deferred until the reindex runs.`,
           );
-          this.dropVectorTables();
-          // No needsReindex — there's no data to re-embed
+          needsReindex = true;
+          this.reindexPending = true;
+          reindexReason = "vec0 dimension mismatch";
         }
       }
     }
@@ -590,7 +611,7 @@ export class VectorStore implements IMemoryStore {
     // Vector virtual table (cosine distance) — only created when dimensions > 0.
     // When provider="none", dimensions=0 and vec0 tables are deferred until a
     // real embedding provider is configured.
-    if (this.dimensions > 0) {
+    if (this.dimensions > 0 && !this.reindexPending) {
       this.db.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS l1_vec USING vec0(
           record_id TEXT PRIMARY KEY,
@@ -619,7 +640,7 @@ export class VectorStore implements IMemoryStore {
         metadata_json=excluded.metadata_json
     `);
 
-    if (this.dimensions > 0) {
+    if (this.dimensions > 0 && !this.reindexPending) {
       this.stmtDeleteVec = this.db.prepare("DELETE FROM l1_vec WHERE record_id = ?");
       this.stmtInsertVec = this.db.prepare("INSERT INTO l1_vec (record_id, embedding, updated_time) VALUES (?, ?, ?)");
     }
@@ -631,7 +652,7 @@ export class VectorStore implements IMemoryStore {
       FROM l1_records WHERE record_id = ?
     `);
 
-    if (this.dimensions > 0) {
+    if (this.dimensions > 0 && !this.reindexPending) {
       this.stmtSearchVec = this.db.prepare(`
         SELECT record_id, distance
         FROM l1_vec
@@ -671,7 +692,7 @@ export class VectorStore implements IMemoryStore {
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_l0_timestamp ON l0_conversations(timestamp)");
 
     // L0 vector virtual table (cosine distance, same dimensions as L1) — deferred when dimensions=0
-    if (this.dimensions > 0) {
+    if (this.dimensions > 0 && !this.reindexPending) {
       this.db.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS l0_vec USING vec0(
           record_id TEXT PRIMARY KEY,
@@ -692,7 +713,7 @@ export class VectorStore implements IMemoryStore {
         timestamp=excluded.timestamp
     `);
 
-    if (this.dimensions > 0) {
+    if (this.dimensions > 0 && !this.reindexPending) {
       this.stmtL0DeleteVec = this.db.prepare("DELETE FROM l0_vec WHERE record_id = ?");
       this.stmtL0InsertVec = this.db.prepare("INSERT INTO l0_vec (record_id, embedding, recorded_at) VALUES (?, ?, ?)");
     }
@@ -703,7 +724,7 @@ export class VectorStore implements IMemoryStore {
       FROM l0_conversations WHERE record_id = ?
     `);
 
-    if (this.dimensions > 0) {
+    if (this.dimensions > 0 && !this.reindexPending) {
       this.stmtL0SearchVec = this.db.prepare(`
         SELECT record_id, distance
         FROM l0_vec
@@ -837,13 +858,14 @@ export class VectorStore implements IMemoryStore {
       );
     }
 
-    // Save current embedding meta ONLY when no reindex is pending. When
-    // needsReindex is true, the vector tables were just dropped and hold no
-    // data yet — writing meta now would claim "current" and a crash during
-    // the reindex would leave the tables permanently unrebuilt (no change
-    // detected on the next boot → never retried). Instead, leave the stale
-    // meta (or none) in place so the next boot still detects the change and
-    // retries; the reindex path calls markEmbeddingCurrent() after success.
+    // Save current embedding meta ONLY when no reindex is pending. When a
+    // rebuild is pending, the vector tables are frozen (NOT dropped — old
+    // vectors stay on disk so a config revert restores them) and hold stale
+    // vectors at possibly-stale dimensions. Writing meta now would claim
+    // "current" — a crash during the approved rebuild would leave the tables
+    // permanently unrebuilt (no change detected on the next boot → never
+    // retried). Leave the stale meta so the next boot still detects the
+    // change; the rebuild path calls markEmbeddingCurrent() after success.
     if (providerInfo && !needsReindex) {
       this.writeEmbeddingMeta({
         provider: providerInfo.provider,
@@ -852,8 +874,9 @@ export class VectorStore implements IMemoryStore {
       });
     }
 
-    // Mark vec0 tables as ready only when they were actually created
-    this.vecTablesReady = this.dimensions > 0;
+    // Mark vec0 tables as ready only when they were actually created AND no
+    // rebuild is pending (pending tables may hold stale-width vectors).
+    this.vecTablesReady = this.dimensions > 0 && !this.reindexPending;
     // L1 query statements (for l1-reader)
     const l1QueryCols = `record_id, content, type, priority, scene_name, session_key, session_id,
       timestamp_str, timestamp_start, timestamp_end,
@@ -939,6 +962,86 @@ export class VectorStore implements IMemoryStore {
       model: providerInfo.model,
       dimensions: this.dimensions,
     });
+  }
+
+  /**
+   * (Re)create the vec0 tables and prepared statements at the current
+   * dimensions. Used by the approved reindex path to perform the drop+rebuild
+   * AFTER approval — initSchema deliberately defers this when a rebuild is
+   * pending so a config typo never destroys the vector index.
+   *
+   * Requires an explicit providerInfo: the rebuild must record exactly which
+   * provider/model/dimensions the fresh tables were built for (all three from
+   * one source — mixing sources is how inconsistent meta gets persisted).
+   * Returns false if the store cannot rebuild (degraded, bad dimensions).
+   * Idempotent and self-correcting: drops existing tables first even when the
+   * caller believes they are absent, so a half-built state is recoverable.
+   */
+  rebuildVecTables(providerInfo: EmbeddingProviderInfo): boolean {
+    if (this.degraded) {
+      this.logger?.warn(`${TAG} rebuildVecTables skipped: VectorStore is in degraded mode`);
+      return false;
+    }
+    if (!this.dimensions || this.dimensions <= 0) {
+      this.logger?.warn(`${TAG} rebuildVecTables refused: dimensions=${this.dimensions}`);
+      return false;
+    }
+    try {
+      // Drop any existing tables (stale-width or leftover from a previous
+      // partial rebuild) and recreate at the CURRENT configured dimensions.
+      this.dropVectorTables();
+      this.db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS l1_vec USING vec0(
+          record_id TEXT PRIMARY KEY,
+          embedding float[${this.dimensions}] distance_metric=cosine,
+          updated_time TEXT DEFAULT ''
+        )
+      `);
+      this.db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS l0_vec USING vec0(
+          record_id TEXT PRIMARY KEY,
+          embedding float[${this.dimensions}] distance_metric=cosine,
+          recorded_at TEXT DEFAULT ''
+        )
+      `);
+
+      // Re-prepare the vec statements (they were skipped at init when the
+      // rebuild was pending).
+      this.stmtDeleteVec = this.db.prepare("DELETE FROM l1_vec WHERE record_id = ?");
+      this.stmtInsertVec = this.db.prepare(
+        "INSERT INTO l1_vec (record_id, embedding, updated_time) VALUES (?, ?, ?)",
+      );
+      this.stmtL0DeleteVec = this.db.prepare("DELETE FROM l0_vec WHERE record_id = ?");
+      this.stmtL0InsertVec = this.db.prepare(
+        "INSERT INTO l0_vec (record_id, embedding, recorded_at) VALUES (?, ?, ?)",
+      );
+      this.stmtSearchVec = this.db.prepare(`
+        SELECT record_id, distance
+        FROM l1_vec
+        WHERE embedding MATCH ?
+          AND k = ?
+        ORDER BY distance
+      `);
+      this.stmtL0SearchVec = this.db.prepare(`
+        SELECT record_id, distance
+        FROM l0_vec
+        WHERE embedding MATCH ?
+          AND k = ?
+        ORDER BY distance
+      `);
+
+      this.reindexPending = false;
+      this.vecTablesReady = true;
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger?.error(
+        `${TAG} rebuildVecTables failed: ${message}. VectorStore entering degraded mode.`,
+      );
+      this.degraded = true;
+      this.vecTablesReady = false;
+      return false;
+    }
   }
 
   /** Allowed table names for row counting (whitelist to prevent SQL injection). */
@@ -1831,10 +1934,17 @@ export class VectorStore implements IMemoryStore {
   async reindexAll(
     embedFn: (text: string) => Promise<Float32Array>,
     onProgress?: (done: number, total: number, layer: "L1" | "L0") => void,
-  ): Promise<{ l1Count: number; l0Count: number; l1Failed: number; l0Failed: number }> {
+  ): Promise<{
+    l1Count: number;
+    l0Count: number;
+    l1Failed: number;
+    l0Failed: number;
+    l1Total: number;
+    l0Total: number;
+  }> {
     if (this.degraded || !this.vecTablesReady) {
       if (this.degraded) this.logger?.warn(`${TAG} reindexAll skipped: VectorStore is in degraded mode`);
-      return { l1Count: 0, l0Count: 0, l1Failed: 0, l0Failed: 0 };
+      return { l1Count: 0, l0Count: 0, l1Failed: 0, l0Failed: 0, l1Total: 0, l0Total: 0 };
     }
 
     try {
@@ -1896,12 +2006,19 @@ export class VectorStore implements IMemoryStore {
         `${TAG} Reindex done: L1=${l1Done}/${l1Rows.length} (${l1Failed} failed), L0=${l0Done}/${l0Rows.length} (${l0Failed} failed)`,
       );
 
-      return { l1Count: l1Done, l0Count: l0Done, l1Failed, l0Failed };
+      return {
+        l1Count: l1Done,
+        l0Count: l0Done,
+        l1Failed,
+        l0Failed,
+        l1Total: l1Rows.length,
+        l0Total: l0Rows.length,
+      };
     } catch (err) {
       this.logger?.error(
         `${TAG} reindexAll failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
       );
-      return { l1Count: 0, l0Count: 0, l1Failed: 0, l0Failed: 0 };
+      return { l1Count: 0, l0Count: 0, l1Failed: 0, l0Failed: 0, l1Total: 0, l0Total: 0 };
     }
   }
 

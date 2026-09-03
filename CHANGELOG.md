@@ -8,6 +8,24 @@
 
 ### ✨ 新功能
 
+- **向量重建审批门（`reindex.approveChanges`）**：检测到 embedding provider/model/dimensions 变更时，向量表现在**冻结**（保留在磁盘上、不被销毁、vecTablesReady=false —— vector search 暂停、keyword/FTS 召回不受影响），直到人工批准。默认 `false`：配置修改（笔误、实验、误粘贴）不再静默触发破坏性重建；批准方式：设置该标志后重启，或运行 `scripts/reindex-now.ts`（运行即批准）。撤销配置可完整恢复旧索引——检测阶段**不删除任何数据**。
+- **崩溃安全的重建语义**：`embedding_meta` 仅在重建完全成功后写入（新增 `markEmbeddingCurrent`）；重建中途崩溃会保留过期 meta，下次启动自动重试，而不是永久停留在未索引状态。`reindexAll` 现在返回真实成功/失败计数（失败不再计为完成）以及总数，调用方以"零失败且全覆盖"为标记条件（空结果集不再被误认为成功）。
+- **重建前的就绪等待**：本地 embedding（node-llama-cpp）需预热后 `embed()` 才可用；重建路径现在调用 `startWarmup()` 并轮询 `isReady()`（5 分钟上限），而不是盲目调用导致逐行 `EmbeddingNotReadyError`、静默空索引。
+- **重建并发锁（`reindex.lock`）**：多 pi 进程共享全局存储并发启动时，仅一个进程执行重建；锁持有者 pid 死亡时锁被抢占（不会永久阻塞），并带 30 分钟 TTL 兜底（防 pid 复用/NFS 场景）。
+- **`rebuildVecTables()`**：新增 store 方法，将破坏性的 drop+recreate 移入审批后的重建路径，并从 initSchema 中移除（配置变更在启动时不再自动删除向量表）。所有 vec0 建表/语句准备块在重建挂起时跳过（6 处）。
+- 新增 `scripts/reindex-now.ts`：手动重建+重嵌入工具（运行即批准，成功后标记 meta current）。
+
+### 🐛 修复
+
+- 修复检测到 embedding 配置变更时 `initSchema` 立即 drop 向量表的破坏性行为——现改为冻结并延迟到批准的重建内执行。
+- 修复 `reindexAll` 将失败行计为完成、在全部失败时仍报告 "complete" 的问题。
+
+---
+
+## [Unreleased]
+
+### ✨ 新功能
+
 - **时区可配置** ([#75](https://github.com/Tencent/TencentDB-Agent-Memory/issues/75) / [#87](https://github.com/Tencent/TencentDB-Agent-Memory/issues/87))：新增顶层 `timezone` 配置项，支持 IANA 时区名（`Asia/Shanghai`、`Europe/Berlin`）和 UTC 偏移串（`+08:00`、`-05:30`）。默认 `"system"`（跟随进程系统时区），升级零感。
   - **暴露给 LLM 的时间戳**统一为带显式 offset 的 ISO 8601（如 `2026-04-07T11:04:45+08:00`），修复 #87 报告的 UTC/本地时区混用导致 LLM 误算时间差的问题。
   - **L1 / L2 prompt 顶部**自动插入时区声明，指引 LLM 按正确时区推算"昨天"、"上周"等相对时间。

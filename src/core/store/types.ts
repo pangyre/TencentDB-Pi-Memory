@@ -304,7 +304,22 @@ export interface IMemoryStore {
   reindexAll(
     embedFn: (text: string) => Promise<Float32Array>,
     onProgress?: (done: number, total: number, layer: "L1" | "L0") => void,
-  ): Promise<{ l1Count: number; l0Count: number; l1Failed: number; l0Failed: number }>;
+  ): Promise<{
+    l1Count: number;
+    l0Count: number;
+    l1Failed: number;
+    l0Failed: number;
+    l1Total: number;
+    l0Total: number;
+  }>;
+
+  /**
+   * Rebuild the vector tables at the current configured dimensions. Used by
+   * the approved reindex path: the destructive drop+recreate happens HERE,
+   * gated behind reindex.approveChanges — never at store init. Callers must
+   * verify the returned totals before marking the embedding current.
+   */
+  rebuildVecTables?(providerInfo: EmbeddingProviderInfo): boolean;
 
   /**
    * Persist the embedding provider/model/dimensions as fully indexed.

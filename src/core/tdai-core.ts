@@ -414,38 +414,47 @@ export class TdaiCore {
       this.logger.debug?.(`${TAG} Stores initialized: backend=${this.cfg.storeBackend}, embedding=${this.cfg.embedding.provider}`);
 
       // Embedding config changed (provider / model / dimensions) — the store
-      // dropped and rebuilt its vector tables at the new width; the texts are
-      // NOT yet embedded. Reindex in the background so semantic search has
-      // vectors. Only fires when the persisted embedding_meta differs from
-      // current config — steady-state boots skip this entirely.
+      // detected the change and set reindexPending: the vector tables are
+      // FROZEN (intact on disk, vecTablesReady=false — nothing dropped, no
+      // destructive work done). Reindex in the background so semantic search
+      // has vectors. Only fires when the persisted embedding_meta differs
+      // from current config — steady-state boots skip this entirely.
       //
-      // Defect guards (all four):
+      // Defect guards (all five):
       // D1 crash-safety — embedding_meta is NOT updated by initSchema when a
-      //    reindex is pending (see sqlite.ts); we write it only after a fully
+      //    rebuild is pending (see sqlite.ts); we write it only after a fully
       //    successful pass via markEmbeddingCurrent(). A crash mid-reindex
       //    leaves meta stale → next boot re-detects and retries.
-      // D2 honest counts — reindexAll returns failed counts; we only mark
-      //    current when l1Failed+l0Failed === 0.
+      // D2 honest counts — reindexAll returns failed counts AND totals; we
+      //    only mark current when failed===0 AND counts===totals (an empty
+      //    candidate set is not success).
       // D3 readiness — local (node-llama-cpp) providers need warmup before
       //    embed() will succeed; we call startWarmup() and wait for isReady()
       //    instead of firing embed() blind.
       // D4 concurrency — a lock file (dataDir/reindex.lock) ensures only one
       //    pi process runs the reindex when several boot against the shared
       //    global store; the loser skips and lets the winner mark current.
+      // D5 approval — reindexing is destructive (drop + full re-embed of
+      //    every stored text). A config change may be accidental (typo,
+      //    experiment); it must NOT silently trigger it. Opt-in via
+      //    reindex.approveChanges; unapproved changes leave the index
+      //    frozen and warn on every boot until a human decides.
       if (stores.needsReindex && this.vectorStore && this.embeddingService) {
         if (!this.cfg.reindex.approveChanges) {
-          // Approval gate: reindexing DROPS the vector tables and re-embeds
-          // every stored text — destructive and potentially expensive. A
-          // config change may be a typo, experiment, or accidental edit; it
-          // must NOT silently trigger a rebuild. Leave embedding_meta stale
-          // (see sqlite.ts initSchema) so this is re-detected on every boot
-          // until a human decides. Vector search stays off; keyword recall is
-          // unaffected.
+          // D5 approval gate: the vector tables are frozen (intact, but
+          // stale-width/stale-model — vector search is OFF while pending).
+          // Nothing has been destroyed: the drop happens only inside the
+          // approved rebuild. Keyword/FTS recall is unaffected. Old vectors
+          // survive on disk, so reverting the config restores the old index
+          // with zero loss.
           this.logger?.warn(
             `${TAG} Embedding config change detected (${stores.reindexReason ?? "provider/model/dimensions"}) ` +
-              `but reindex is NOT auto-approved. Vector search is disabled until you approve. ` +
+              `but reindex is NOT auto-approved. Vector tables are frozen (intact, not rebuilt) ` +
+              `and vector search is disabled until you approve. ` +
               `To approve, set "reindex": { "approveChanges": true } in the memory config and restart, ` +
-              `or run the explicit reindex tool/script. Keyword/FTS recall is unaffected.`,
+              `or run the explicit reindex tool/script (scripts/reindex-now.ts). ` +
+              `Reverting the embedding config restores the previous index untouched. ` +
+              `Keyword/FTS recall is unaffected.`,
           );
           return;
         }
@@ -455,7 +464,7 @@ export class TdaiCore {
         const reason = stores.reindexReason ?? "embedding config changed";
         this.logger?.info(
           `${TAG} ${reason}; reindex APPROVED (reindex.approveChanges=true); ` +
-            `re-embedding all stored texts in the background ` +
+            `rebuilding vector tables and re-embedding all stored texts in the background ` +
             `(L1 + L0 through ${this.cfg.embedding.provider}/${this.cfg.embedding.model ?? es.getProviderInfo().model})...`,
         );
 
@@ -479,10 +488,25 @@ export class TdaiCore {
               return true;
             } catch {
               // Lock exists — is the owner alive?
-              try {
-                const raw = fs.readFileSync(lockPath, "utf8");
-                const owner = JSON.parse(raw) as { pid?: number; ts?: number };
-                if (typeof owner.pid === "number" && owner.pid > 0) {
+            try {
+              const raw = fs.readFileSync(lockPath, "utf8");
+              const owner = JSON.parse(raw) as { pid?: number; ts?: number };
+              // L2 backstop: a lock older than 30 min is stale regardless of
+              // pid liveness (pid recycling can make a dead owner look alive;
+              // a reindex takes minutes, not half an hour).
+              if (typeof owner.ts === "number" && Date.now() - owner.ts > 30 * 60 * 1000) {
+                this.logger?.info?.(`${TAG} Reindex lock older than 30min — stealing.`);
+                try { fs.unlinkSync(lockPath); } catch { /* raced */ }
+                try {
+                  const fd = fs.openSync(lockPath, "wx");
+                  fs.writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+                  fs.closeSync(fd);
+                  return true;
+                } catch {
+                  return false;
+                }
+              }
+              if (typeof owner.pid === "number" && owner.pid > 0) {
                   try {
                     process.kill(owner.pid, 0); // throws ESRCH if dead
                     return false; // owner alive — they are reindexing
@@ -544,6 +568,17 @@ export class TdaiCore {
               }
             }
 
+            // The destructive step happens HERE — inside the approved,
+            // locked, readied path: drop stale-width tables, recreate at the
+            // configured dimensions, re-prepare vec statements.
+            if (!vs.rebuildVecTables?.(es.getProviderInfo())) {
+              this.logger?.warn?.(
+                `${TAG} Vector table rebuild refused/failed — aborting reindex. ` +
+                  `Tables left frozen (nothing destroyed); meta stays stale; next boot will retry.`,
+              );
+              return;
+            }
+
             const result = await vs.reindexAll(
               async (text) => es.embed(text),
               (done, totalCount, layer) => {
@@ -553,16 +588,22 @@ export class TdaiCore {
               },
             );
 
-            if (result.l1Failed === 0 && result.l0Failed === 0) {
+            // D2 + H1: mark current only on zero failures AND full coverage —
+            // an empty candidate set is not success (a silently broken text
+            // query must not read as "index built").
+            const total = result.l1Total + result.l0Total;
+            const done = result.l1Count + result.l0Count;
+            if (result.l1Failed === 0 && result.l0Failed === 0 && done === total) {
               // D1: only now is the store fully indexed at the new config.
               vs.markEmbeddingCurrent?.(es.getProviderInfo());
               this.logger?.info?.(
-                `${TAG} Background reindex complete: L1=${result.l1Count}, L0=${result.l0Count}; embedding marked current.`,
+                `${TAG} Background reindex complete: L1=${result.l1Count}/${result.l1Total}, L0=${result.l0Count}/${result.l0Total}; embedding marked current.`,
               );
             } else {
-              // D2: honest failure report; meta stays stale → next boot retries.
+              // Honest failure report; meta stays stale → next boot retries.
               this.logger?.warn?.(
-                `${TAG} Reindex finished with failures (L1 ${result.l1Failed} failed, L0 ${result.l0Failed} failed). ` +
+                `${TAG} Reindex incomplete (L1 ${result.l1Count}/${result.l1Total} done, ${result.l1Failed} failed; ` +
+                  `L0 ${result.l0Count}/${result.l0Total} done, ${result.l0Failed} failed). ` +
                   `Embedding meta left stale so the next boot retries. Keyword recall unaffected.`,
               );
             }
