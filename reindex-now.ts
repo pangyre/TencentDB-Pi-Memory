@@ -60,5 +60,14 @@ const result = await vs.reindexAll(
   },
 );
 const elapsed = ((Date.now() - started) / 1000).toFixed(1);
-console.log(`Reindex complete in ${elapsed}s: L1=${result.l1Count}, L0=${result.l0Count}`);
-process.exit(0);
+console.log(`Reindex finished in ${elapsed}s: L1=${result.l1Count} (${result.l1Failed} failed), L0=${result.l0Count} (${result.l0Failed} failed)`);
+
+// Running this script IS the explicit approval — on a fully successful pass,
+// mark the embedding provider as current so steady-state boots stop re-detecting.
+if (result.l1Failed === 0 && result.l0Failed === 0) {
+  vs.markEmbeddingCurrent(es.getProviderInfo());
+  console.log("Marked embedding config as current (no failures).");
+} else {
+  console.log("NOT marked current: failures present. Re-run after fixing the cause; meta stays stale so the next boot/run retries.");
+}
+process.exit(result.l1Failed === 0 && result.l0Failed === 0 ? 0 : 1);

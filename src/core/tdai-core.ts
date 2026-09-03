@@ -19,6 +19,8 @@
  *   // HTTP handler calls core.handleBeforeRecall / core.handleTurnCommitted / etc.
  */
 
+import fs from "node:fs";
+import path from "node:path";
 import type {
   HostAdapter,
   Logger,
@@ -413,49 +415,164 @@ export class TdaiCore {
 
       // Embedding config changed (provider / model / dimensions) — the store
       // dropped and rebuilt its vector tables at the new width; the texts are
-      // NOT yet embedded. Fire a one-time background reindex so semantic
-      // search has vectors to search. Only fires when the persisted
-      // embedding_meta differs from current config — steady-state boots skip
-      // this entirely (a single metadata compare, no embed cost).
+      // NOT yet embedded. Reindex in the background so semantic search has
+      // vectors. Only fires when the persisted embedding_meta differs from
+      // current config — steady-state boots skip this entirely.
+      //
+      // Defect guards (all four):
+      // D1 crash-safety — embedding_meta is NOT updated by initSchema when a
+      //    reindex is pending (see sqlite.ts); we write it only after a fully
+      //    successful pass via markEmbeddingCurrent(). A crash mid-reindex
+      //    leaves meta stale → next boot re-detects and retries.
+      // D2 honest counts — reindexAll returns failed counts; we only mark
+      //    current when l1Failed+l0Failed === 0.
+      // D3 readiness — local (node-llama-cpp) providers need warmup before
+      //    embed() will succeed; we call startWarmup() and wait for isReady()
+      //    instead of firing embed() blind.
+      // D4 concurrency — a lock file (dataDir/reindex.lock) ensures only one
+      //    pi process runs the reindex when several boot against the shared
+      //    global store; the loser skips and lets the winner mark current.
       if (stores.needsReindex && this.vectorStore && this.embeddingService) {
+        if (!this.cfg.reindex.approveChanges) {
+          // Approval gate: reindexing DROPS the vector tables and re-embeds
+          // every stored text — destructive and potentially expensive. A
+          // config change may be a typo, experiment, or accidental edit; it
+          // must NOT silently trigger a rebuild. Leave embedding_meta stale
+          // (see sqlite.ts initSchema) so this is re-detected on every boot
+          // until a human decides. Vector search stays off; keyword recall is
+          // unaffected.
+          this.logger?.warn(
+            `${TAG} Embedding config change detected (${stores.reindexReason ?? "provider/model/dimensions"}) ` +
+              `but reindex is NOT auto-approved. Vector search is disabled until you approve. ` +
+              `To approve, set "reindex": { "approveChanges": true } in the memory config and restart, ` +
+              `or run the explicit reindex tool/script. Keyword/FTS recall is unaffected.`,
+          );
+          return;
+        }
+
         const vs = this.vectorStore;
         const es = this.embeddingService;
         const reason = stores.reindexReason ?? "embedding config changed";
         this.logger?.info(
-          `${TAG} ${reason}; re-embedding all stored texts in the background ` +
+          `${TAG} ${reason}; reindex APPROVED (reindex.approveChanges=true); ` +
+            `re-embedding all stored texts in the background ` +
             `(L1 + L0 through ${this.cfg.embedding.provider}/${this.cfg.embedding.model ?? es.getProviderInfo().model})...`,
         );
+
         // Deliberately not awaited: boot must not block on a full re-embed.
-        // Rows are embedded one at a time; each failure is skipped and logged
-        // by reindexAll (non-fatal). Keyword/FTS recall remains available
-        // while the background pass runs.
+        // Keyword/FTS recall remains available while the background pass runs.
         void (async () => {
+          const lockPath = path.join(this.dataDir, "reindex.lock");
+
+          // D4: acquire an exclusive lock or skip (another process is doing
+          // it). Staleness: if the lock owner's pid is dead (process crashed
+          // or was killed), steal the lock so a future boot can retry —
+          // otherwise a stale lock would block reindexing forever.
+          const acquireLock = (): boolean => {
+            try {
+              fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+            } catch { /* ignore */ }
+            try {
+              const fd = fs.openSync(lockPath, "wx");
+              fs.writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+              fs.closeSync(fd);
+              return true;
+            } catch {
+              // Lock exists — is the owner alive?
+              try {
+                const raw = fs.readFileSync(lockPath, "utf8");
+                const owner = JSON.parse(raw) as { pid?: number; ts?: number };
+                if (typeof owner.pid === "number" && owner.pid > 0) {
+                  try {
+                    process.kill(owner.pid, 0); // throws ESRCH if dead
+                    return false; // owner alive — they are reindexing
+                  } catch {
+                    // ESRCH → owner dead → steal
+                    try { fs.unlinkSync(lockPath); } catch { /* raced */ }
+                    try {
+                      const fd = fs.openSync(lockPath, "wx");
+                      fs.writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+                      fs.closeSync(fd);
+                      return true;
+                    } catch {
+                      return false; // another process stole it first
+                    }
+                  }
+                }
+                // Malformed lock with no pid — stale by definition; steal.
+                try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
+                try {
+                  const fd = fs.openSync(lockPath, "wx");
+                  fs.writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+                  fs.closeSync(fd);
+                  return true;
+                } catch {
+                  return false;
+                }
+              } catch {
+                return false; // cannot read lock — do not fight over it
+              }
+            }
+          };
+
+          if (!acquireLock()) {
+            this.logger?.info?.(
+              `${TAG} Reindex lock held by another live process — skipping (they will mark embedding current).`,
+            );
+            return;
+          }
+
+          const releaseLock = () => {
+            try { fs.unlinkSync(lockPath); } catch { /* best-effort */ }
+          };
+
           try {
-            const before = await es.embed("reindex warmup");
-            void before;
-          } catch { /* warmup is best-effort */ }
-          try {
+            // D3: local providers must be warm before embed() works.
+            if (!es.isReady()) {
+              this.logger?.info?.(`${TAG} Waiting for embedding service readiness before reindex...`);
+              es.startWarmup();
+              const readyAt = Date.now() + 5 * 60 * 1000; // 5 min for model download+load
+              while (!es.isReady()) {
+                if (Date.now() > readyAt) {
+                  this.logger?.warn?.(
+                    `${TAG} Embedding service not ready after 5min — aborting reindex. ` +
+                      `Meta left stale; next boot will retry.`,
+                  );
+                  return;
+                }
+                await new Promise((r) => setTimeout(r, 1000));
+              }
+            }
+
             const result = await vs.reindexAll(
-              async (text) => {
-                const emb = await es.embed(text);
-                return emb;
-              },
+              async (text) => es.embed(text),
               (done, totalCount, layer) => {
                 if (done === 1 || done % 500 === 0 || done === totalCount) {
-                  this.logger?.info?.(
-                    `${TAG} reindex progress: ${layer} ${done}/${totalCount}`,
-                  );
+                  this.logger?.info?.(`${TAG} reindex progress: ${layer} ${done}/${totalCount}`);
                 }
               },
             );
-            this.logger?.info(
-              `${TAG} Background reindex complete: L1=${result.l1Count}, L0=${result.l0Count}`,
-            );
+
+            if (result.l1Failed === 0 && result.l0Failed === 0) {
+              // D1: only now is the store fully indexed at the new config.
+              vs.markEmbeddingCurrent?.(es.getProviderInfo());
+              this.logger?.info?.(
+                `${TAG} Background reindex complete: L1=${result.l1Count}, L0=${result.l0Count}; embedding marked current.`,
+              );
+            } else {
+              // D2: honest failure report; meta stays stale → next boot retries.
+              this.logger?.warn?.(
+                `${TAG} Reindex finished with failures (L1 ${result.l1Failed} failed, L0 ${result.l0Failed} failed). ` +
+                  `Embedding meta left stale so the next boot retries. Keyword recall unaffected.`,
+              );
+            }
           } catch (err) {
             this.logger?.warn(
               `${TAG} Background reindex failed (non-fatal; keyword recall unaffected): ` +
                 `${err instanceof Error ? err.message : String(err)}`,
             );
+          } finally {
+            releaseLock();
           }
         })();
       }

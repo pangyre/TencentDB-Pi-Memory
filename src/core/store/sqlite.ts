@@ -837,8 +837,14 @@ export class VectorStore implements IMemoryStore {
       );
     }
 
-    // Save current embedding meta (write after schema is ready)
-    if (providerInfo) {
+    // Save current embedding meta ONLY when no reindex is pending. When
+    // needsReindex is true, the vector tables were just dropped and hold no
+    // data yet — writing meta now would claim "current" and a crash during
+    // the reindex would leave the tables permanently unrebuilt (no change
+    // detected on the next boot → never retried). Instead, leave the stale
+    // meta (or none) in place so the next boot still detects the change and
+    // retries; the reindex path calls markEmbeddingCurrent() after success.
+    if (providerInfo && !needsReindex) {
       this.writeEmbeddingMeta({
         provider: providerInfo.provider,
         model: providerInfo.model,
@@ -918,6 +924,21 @@ export class VectorStore implements IMemoryStore {
     this.db.prepare(
       "INSERT INTO embedding_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
     ).run("embedding_provider_info", JSON.stringify(meta));
+  }
+
+  /**
+   * Mark the current embedding provider/model/dimensions as fully indexed.
+   * Called AFTER a successful reindexAll() so that a crash mid-reindex leaves
+   * the stored meta stale — the next boot detects the change again and
+   * retries instead of silently staying unindexed.
+   */
+  markEmbeddingCurrent(providerInfo: EmbeddingProviderInfo): void {
+    if (!providerInfo) return;
+    this.writeEmbeddingMeta({
+      provider: providerInfo.provider,
+      model: providerInfo.model,
+      dimensions: this.dimensions,
+    });
   }
 
   /** Allowed table names for row counting (whitelist to prevent SQL injection). */
@@ -1810,16 +1831,17 @@ export class VectorStore implements IMemoryStore {
   async reindexAll(
     embedFn: (text: string) => Promise<Float32Array>,
     onProgress?: (done: number, total: number, layer: "L1" | "L0") => void,
-  ): Promise<{ l1Count: number; l0Count: number }> {
+  ): Promise<{ l1Count: number; l0Count: number; l1Failed: number; l0Failed: number }> {
     if (this.degraded || !this.vecTablesReady) {
       if (this.degraded) this.logger?.warn(`${TAG} reindexAll skipped: VectorStore is in degraded mode`);
-      return { l1Count: 0, l0Count: 0 };
+      return { l1Count: 0, l0Count: 0, l1Failed: 0, l0Failed: 0 };
     }
 
     try {
       // ── Re-embed L1 ──
       const l1Rows = this.getAllL1Texts();
       let l1Done = 0;
+      let l1Failed = 0;
       for (const { record_id, content, updated_time } of l1Rows) {
         try {
           const embedding = await embedFn(content);
@@ -1833,18 +1855,20 @@ export class VectorStore implements IMemoryStore {
             try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
             throw txErr;
           }
+          l1Done++;
         } catch (err) {
+          l1Failed++;
           this.logger?.warn?.(
-            `${TAG} reindex L1 skip ${record_id}: ${err instanceof Error ? err.message : String(err)}`,
+            `${TAG} reindex L1 skip ${record_id} (${l1Failed}): ${err instanceof Error ? err.message : String(err)}`,
           );
         }
-        l1Done++;
-        onProgress?.(l1Done, l1Rows.length, "L1");
+        onProgress?.(l1Done + l1Failed, l1Rows.length, "L1");
       }
 
       // ── Re-embed L0 ──
       const l0Rows = this.getAllL0Texts();
       let l0Done = 0;
+      let l0Failed = 0;
       for (const { record_id, message_text, recorded_at } of l0Rows) {
         try {
           const embedding = await embedFn(message_text);
@@ -1858,25 +1882,26 @@ export class VectorStore implements IMemoryStore {
             try { this.db.exec("ROLLBACK"); } catch { /* ignore */ }
             throw txErr;
           }
+          l0Done++;
         } catch (err) {
+          l0Failed++;
           this.logger?.warn?.(
-            `${TAG} reindex L0 skip ${record_id}: ${err instanceof Error ? err.message : String(err)}`,
+            `${TAG} reindex L0 skip ${record_id} (${l0Failed}): ${err instanceof Error ? err.message : String(err)}`,
           );
         }
-        l0Done++;
-        onProgress?.(l0Done, l0Rows.length, "L0");
+        onProgress?.(l0Done + l0Failed, l0Rows.length, "L0");
       }
 
       this.logger?.info(
-        `${TAG} Reindex complete: L1=${l1Done}/${l1Rows.length}, L0=${l0Done}/${l0Rows.length}`,
+        `${TAG} Reindex done: L1=${l1Done}/${l1Rows.length} (${l1Failed} failed), L0=${l0Done}/${l0Rows.length} (${l0Failed} failed)`,
       );
 
-      return { l1Count: l1Done, l0Count: l0Done };
+      return { l1Count: l1Done, l0Count: l0Done, l1Failed, l0Failed };
     } catch (err) {
       this.logger?.error(
         `${TAG} reindexAll failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
       );
-      return { l1Count: 0, l0Count: 0 };
+      return { l1Count: 0, l0Count: 0, l1Failed: 0, l0Failed: 0 };
     }
   }
 

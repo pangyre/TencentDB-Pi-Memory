@@ -134,7 +134,27 @@ export interface EmbeddingConfig {
   configError?: string;
 }
 
-/** Daily cleaner settings for local JSONL data (L0/L1). */
+/**
+ * Reindex policy — controls whether an embedding provider/model/dimension
+ * change in config is automatically applied to the vector store.
+ *
+ * Reindexing DROPS the vector tables and re-embeds every stored text: it is
+ * destructive and can be expensive (thousands of embedding calls). A config
+ * edit — intentional or not (typo, experiment, accidental paste) — must NOT
+ * silently trigger it. Auto-approval is opt-in.
+ */
+export interface ReindexConfig {
+  /**
+   * When true, a detected embedding config change auto-runs the background
+   * reindex on the next boot. When false (default), the change is logged and
+   * vector search stays disabled until the human approves — by setting this
+   * flag to true, or by running the explicit reindex tool/script.
+   */
+  approveChanges: boolean;
+}
+
+/**
+ * Daily cleaner settings for local JSONL data (L0/L1). */
 export interface MemoryCleanupConfig {
   /** TTL switch from capture.l0l1RetentionDays. Undefined means disabled. */
   retentionDays?: number;
@@ -304,6 +324,7 @@ export interface MemoryTdaiConfig {
   pipeline: PipelineTriggerConfig;
   recall: RecallConfig;
   embedding: EmbeddingConfig;
+  reindex: ReindexConfig;
   /** Storage backend: "sqlite" (default) or "tcvdb" */
   storeBackend: StoreBackend;
   /** Tencent Cloud VectorDB configuration (required when storeBackend = "tcvdb") */
@@ -569,6 +590,9 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       language: (str(bm25Group, "language") === "en" ? "en" : "zh") as "zh" | "en",
     },
     memoryCleanup,
+    reindex: {
+      approveChanges: bool(obj(c, "reindex"), "approveChanges") ?? false,
+    },
     report: {
       enabled: bool(obj(c, "report"), "enabled") ?? false,
       type: str(obj(c, "report"), "type") ?? "local",

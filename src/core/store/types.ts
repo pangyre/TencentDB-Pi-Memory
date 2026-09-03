@@ -304,7 +304,14 @@ export interface IMemoryStore {
   reindexAll(
     embedFn: (text: string) => Promise<Float32Array>,
     onProgress?: (done: number, total: number, layer: "L1" | "L0") => void,
-  ): Promise<{ l1Count: number; l0Count: number }>;
+  ): Promise<{ l1Count: number; l0Count: number; l1Failed: number; l0Failed: number }>;
+
+  /**
+   * Persist the embedding provider/model/dimensions as fully indexed.
+   * Call AFTER a successful reindexAll so a crash mid-reindex leaves the
+   * stored meta stale — the next boot re-detects the change and retries.
+   */
+  markEmbeddingCurrent?(providerInfo: EmbeddingProviderInfo): void;
 
   // ── FTS (always sync — cached flag) ──────────────────────
 
