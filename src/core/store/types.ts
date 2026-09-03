@@ -318,6 +318,11 @@ export interface IMemoryStore {
    * the approved reindex path: the destructive drop+recreate happens HERE,
    * gated behind reindex.approveChanges — never at store init. Callers must
    * verify the returned totals before marking the embedding current.
+   *
+   * Optional: the TCVDB (server-side) backend intentionally does NOT
+   * implement this — its collections are rebuilt through the TCVDB admin
+   * flow, and embedding_meta does not govern server-side vectors. Callers
+   * must treat a missing implementation as "nothing to rebuild locally".
    */
   rebuildVecTables?(providerInfo: EmbeddingProviderInfo): boolean;
 
