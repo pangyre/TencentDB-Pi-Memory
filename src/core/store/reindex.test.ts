@@ -16,8 +16,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { VectorStore } from "./sqlite.js";
+import { ReindexLock } from "./reindex-lock.js";
 import type { EmbeddingProviderInfo } from "./types.js";
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -53,97 +55,81 @@ function newStore(dir: string, dim = DIM): VectorStore {
   return store;
 }
 
-// ── atomic lock state machine (M1/M2) ──────────────────────────────────────
+// ── reindex lock state machine (M1/M2) — tests the SHIPPING ReindexLock ──
 //
-// Mirrors the temp+link acquire/steal/release pattern used in tdai-core so we
-// can exercise the state machine (incl. concurrent steal) without booting the
-// whole core.
+// P3-3: the lock is imported from src/core/store/reindex-lock.ts — the same
+// module tdai-core uses — so these tests exercise the production code, not a
+// parallel copy. Steal semantics are exercised via maxAgeMs: a lock whose
+// age exceeds maxAgeMs is stolen on the next tryAcquire (TTL backstop). True
+// multi-PROCESS concurrency is arbitrated by the atomic link(2) in
+// tryAcquire (documented; single-threaded tests cannot race it).
 
-function makeLock(lockPath: string, nonce: string) {
-  const readOwner = (): { nonce?: string; ts?: number } | null => {
-    try { return JSON.parse(fs.readFileSync(lockPath, "utf8")); } catch { return null; }
-  };
-  const tryAcquire = (): boolean => {
-    const tmp = `${lockPath}.${nonce}.tmp`;
-    try {
-      fs.writeFileSync(tmp, JSON.stringify({ nonce, ts: Date.now() }));
-      fs.linkSync(tmp, lockPath);
-      return true;
-    } catch {
-      return false;
-    } finally {
-      try { fs.unlinkSync(tmp); } catch { /* gone */ }
-    }
-  };
-  const steal = (): boolean => {
-    try { fs.unlinkSync(lockPath); } catch { /* raced */ }
-    const tmp = `${lockPath}.${nonce}.steal.tmp`;
-    try {
-      fs.writeFileSync(tmp, JSON.stringify({ nonce, ts: Date.now() }));
-      fs.linkSync(tmp, lockPath);
-      return true;
-    } catch {
-      return false;
-    } finally {
-      try { fs.unlinkSync(tmp); } catch { /* gone */ }
-    }
-  };
-  const release = (): void => {
-    const owner = readOwner();
-    if (owner?.nonce === nonce) { try { fs.unlinkSync(lockPath); } catch { /* best-effort */ } }
-  };
-  return { readOwner, tryAcquire, steal, release };
+function makeLock(dir: string, maxAgeMs?: number): { lock: ReindexLock; nonce: string } {
+  const lock = new ReindexLock({ dir, maxAgeMs });
+  return { lock, nonce: lock.nonce };
 }
 
-describe("reindex lock state machine (M1/M2)", () => {
+describe("reindex lock state machine (M1/M2) — shipping ReindexLock", () => {
   let dir: string;
-  let lockPath: string;
 
-  beforeEach(() => {
-    dir = mkTmpDir();
-    lockPath = path.join(dir, "reindex.lock");
-  });
+  beforeEach(() => { dir = mkTmpDir(); });
   afterEach(() => {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
   });
 
-  it("first acquirer wins, second is refused (EEXIST)", () => {
-    const a = makeLock(lockPath, "A");
-    const b = makeLock(lockPath, "B");
-    expect(a.tryAcquire()).toBe(true);
-    expect(b.tryAcquire()).toBe(false);
-    expect(a.readOwner()?.nonce).toBe("A");
+  it("first acquirer wins, second is refused while the lock is fresh", () => {
+    const a = makeLock(dir);
+    const b = makeLock(dir);
+    expect(a.lock.tryAcquire()).toBe(true);
+    expect(b.lock.tryAcquire()).toBe(false);
+    const owner = JSON.parse(fs.readFileSync(path.join(dir, "reindex.lock"), "utf8"));
+    expect(owner.nonce).toBe(a.nonce);
+    a.lock.release();
   });
 
-  it("release only removes the lock if we still own it", () => {
-    const a = makeLock(lockPath, "A");
-    const b = makeLock(lockPath, "B");
-    expect(a.tryAcquire()).toBe(true);
-    // B steals
-    expect(b.steal()).toBe(true);
-    expect(b.readOwner()?.nonce).toBe("B");
+  it("release only removes the lock if we still own it (nonce guard)", () => {
+    const a = makeLock(dir);
+    const b = makeLock(dir, 0); // TTL 0 → any existing lock is stale → b steals
+    expect(a.lock.tryAcquire()).toBe(true);
+    expect(b.lock.tryAcquire()).toBe(true); // stole a's lock
+    expect(b.lock.nonce === a.nonce).toBe(false);
     // A's release must NOT clobber B's lock
-    a.release();
-    expect(b.readOwner()?.nonce).toBe("B");
+    a.lock.release();
+    const owner = JSON.parse(fs.readFileSync(path.join(dir, "reindex.lock"), "utf8"));
+    expect(owner.nonce).toBe(b.nonce);
+    b.lock.release();
+    expect(fs.existsSync(path.join(dir, "reindex.lock"))).toBe(false);
   });
 
-  it("concurrent steal — exactly one winner", () => {
-    // seed a lock owned by a dead owner
-    fs.writeFileSync(lockPath, JSON.stringify({ nonce: "DEAD", ts: Date.now() - 999_999 }));
-    const stealers = ["S1", "S2", "S3", "S4"].map((n) => makeLock(lockPath, n));
-    const results = stealers.map((s) => s.steal());
-    const winners = results.filter(Boolean).length;
-    // At least one wins; the on-disk lock is owned by exactly one stealer.
-    expect(winners).toBeGreaterThanOrEqual(1);
-    const owner = JSON.parse(fs.readFileSync(lockPath, "utf8")).nonce as string;
-    expect(["S1", "S2", "S3", "S4"]).toContain(owner);
+  it("stale lock (past maxAgeMs) is stolen; fresh lock is not", () => {
+    const a = makeLock(dir); // default 30-min TTL
+    expect(a.lock.tryAcquire()).toBe(true);
+    // A fresh holder cannot steal a live lock.
+    const b = makeLock(dir);
+    expect(b.lock.tryAcquire()).toBe(false);
+    // But a TTL-0 holder treats any existing lock as stale and steals it.
+    const c = makeLock(dir, 0);
+    expect(c.lock.tryAcquire()).toBe(true);
+    const owner = JSON.parse(fs.readFileSync(path.join(dir, "reindex.lock"), "utf8"));
+    expect(owner.nonce).toBe(c.nonce);
+    c.lock.release();
   });
 
-  it("release after clean acquire removes the lock", () => {
-    const a = makeLock(lockPath, "A");
-    expect(a.tryAcquire()).toBe(true);
-    a.release();
-    expect(fs.existsSync(lockPath)).toBe(false);
+  it("heartbeat refreshes ts so a slow-but-live pass is not stolen (M2)", async () => {
+    const a = makeLock(dir, 120); // 120ms TTL
+    const b = makeLock(dir, 120);
+    expect(a.lock.tryAcquire()).toBe(true);
+    // Outlive the TTL with heartbeats — a non-heartbeating lock would be
+    // stolen by b here.
+    for (let i = 0; i < 3; i++) {
+      await new Promise((r) => setTimeout(r, 60));
+      a.lock.heartbeat();
+      expect(b.lock.tryAcquire()).toBe(false); // ts refreshed → still fresh
+    }
+    // Without further heartbeats the lock ages out and is stolen.
+    await new Promise((r) => setTimeout(r, 150));
+    expect(b.lock.tryAcquire()).toBe(true);
+    b.lock.release();
   });
 });
 
@@ -184,17 +170,66 @@ describe("reindexPending freezing (approval gate deny path)", () => {
     store.close();
   });
 
-  it("empty DB + dimension mismatch does NOT set needsReindex (H3)", () => {
+  it("empty DB + changed dims via existing meta → no reindex (H3, savedMeta branch)", () => {
     // Boot at dim 8, empty DB, meta written.
     let store = newStore(dir, DIM);
     store.init(providerInfo({ dimensions: DIM }));
     store.close();
 
-    // Wipe meta to simulate legacy-ish path but keep DB empty, reopen at a
-    // different dimension. Empty DB → nothing to re-embed → no needsReindex.
+    // Reopen at a different dimension. savedMeta exists → dimsChanged fires,
+    // but the DB is EMPTY: nothing to re-embed → no needsReindex, no per-boot
+    // warning loop.
     store = newStore(dir, DIM + 4);
     const res = store.init(providerInfo({ dimensions: DIM + 4, model: "m1" }));
     expect(res.needsReindex).toBe(false);
+    store.close();
+  });
+
+  it("empty DB + dim mismatch with NO meta (legacy branch) → no needsReindex either (H3)", () => {
+    // Boot at dim 8, empty DB, meta written — then WIPE embedding_meta to
+    // force the no-saved-meta (legacy) branch on the next open.
+    let store = newStore(dir, DIM);
+    store.init(providerInfo({ dimensions: DIM }));
+    store.close();
+
+    const raw = new DatabaseSync(path.join(dir, "mem.db"));
+    raw.prepare("DELETE FROM embedding_meta").run();
+    raw.close();
+
+    // Reopen at a different dimension, empty DB: the mismatched empty vec
+    // tables are recreated at the new width during init — needsReindex must
+    // stay false (nothing to re-embed), otherwise an empty DB warns forever.
+    store = newStore(dir, DIM + 4);
+    const res = store.init(providerInfo({ dimensions: DIM + 4, model: "m1" }));
+    expect(res.needsReindex).toBe(false);
+    store.close();
+  });
+
+  it("D1 crash-safety: a pending reindex that is never completed re-fires on the next boot", async () => {
+    // Boot 1: build vectors at m1, mark current.
+    let store = newStore(dir);
+    let res = store.init(providerInfo({ model: "m1" }));
+    expect(res.needsReindex).toBe(false);
+    await store.upsertL1(
+      { id: "r1", content: "hello world", type: "fact", priority: 50, scene_name: "", sessionKey: "s", sessionId: "s", timestamps: ["t"], createdAt: "t", updatedAt: "t", metadata: {} } as any,
+      mkEmbedding(1),
+    );
+    store.close();
+
+    // Boot 2: config changed to m2 → pending. Simulate a CRASH during the
+    // approved reindex: do NOT call rebuildVecTables/reindexAll/
+    // markEmbeddingCurrent — just close.
+    store = newStore(dir);
+    res = store.init(providerInfo({ model: "m2" }));
+    expect(res.needsReindex).toBe(true);
+    store.close();
+
+    // Boot 3: the crash left meta stale → the change is RE-DETECTED. This is
+    // the D1 guarantee: without it, a crashed reindex would leave the store
+    // permanently unindexed (meta claiming current, vectors missing).
+    store = newStore(dir);
+    res = store.init(providerInfo({ model: "m2" }));
+    expect(res.needsReindex).toBe(true);
     store.close();
   });
 });
@@ -292,14 +327,38 @@ describe("cross-process schema epoch (H1/H2)", () => {
     b.init(providerInfo({ model: "m1" }));
     expect(b.rebuildVecTables?.(providerInfo({ model: "m1" }))).toBe(true);
 
-    // Process A now writes — its stmtInsertVec is bound to a dropped table.
-    // The epoch guard must trip: metadata write succeeds, vec write skipped,
-    // NO crash.
+    // Process A now writes — its stmtInsertVec is bound to the dropped
+    // table. The epoch guard must trip: metadata write succeeds, vec write
+    // is SKIPPED, no crash. (P0-1: discriminating assertion — a bare
+    // `ok === true` passes whether or not the guard fired, so we verify the
+    // raw tables: a2's metadata row EXISTS, a2's VECTOR row does NOT, and
+    // a1's pre-rebuild vector row does.)
     const ok = await a.upsertL1(
       { id: "a2", content: "after rebuild", type: "fact", priority: 50, scene_name: "", sessionKey: "s", sessionId: "s", timestamps: ["t"], createdAt: "t", updatedAt: "t", metadata: {} } as any,
       mkEmbedding(2),
     );
     expect(ok).toBe(true);
+
+    // P0-1 discriminating assertions, read back through a raw connection
+    // (sqlite-vec must be loaded on it to see the vec0 tables):
+    const { createRequire } = await import("node:module");
+    const req = createRequire(import.meta.url);
+    const sqliteVec = req("sqlite-vec");
+    const raw = new DatabaseSync(dbPath, { allowExtension: true });
+    raw.enableLoadExtension(true);
+    sqliteVec.load(raw);
+
+    const count = (table: string, id: string): number =>
+      (raw.prepare(`SELECT count(*) AS n FROM ${table} WHERE record_id = ?`).get(id) as { n: number }).n;
+
+    const metaA2 = count("l1_records", "a2");
+    const vecA2 = count("l1_vec", "a2");
+    raw.close();
+
+    // a2's metadata row persisted (the safe path), but its VECTOR row was
+    // skipped by the epoch guard — without the guard, both would be present.
+    expect(metaA2).toBe(1);
+    expect(vecA2).toBe(0);
 
     a.close();
     b.close();

@@ -11,16 +11,19 @@
  * so concurrent multi-process access is supported. Keyword/FTS recall is
  * unaffected; vector search gains rows as this pass commits them.
  *
- * Usage: bun scripts/reindex-now.ts   (run from the repo root)
+ * Usage (from the repo root):
+ *   node scripts/reindex-now.mjs
+ * (the .mjs wrapper loads this TS file through the same jiti runtime pi uses)
  */
 import os from "node:os";
 import path from "node:path";
-import { loadMemoryConfig } from "./pi-extension/lib/config.ts";
-import { initStores } from "./src/utils/pipeline-factory.ts";
-import type { PipelineLogger } from "./src/utils/pipeline-factory.ts";
+import { loadMemoryConfig } from "../pi-extension/lib/config.ts";
+import { initStores } from "../src/utils/pipeline-factory.ts";
+import type { PipelineLogger } from "../src/utils/pipeline-factory.ts";
 
+const DEBUG = process.env.TDAI_REINDEX_DEBUG === "1";
 const logger: PipelineLogger = {
-  debug: (...a: unknown[]) => console.log("[debug]", ...a),
+  debug: (...a: unknown[]) => { if (DEBUG) console.log("[debug]", ...a); },
   info: (...a: unknown[]) => console.log("[info]", ...a),
   warn: (...a: unknown[]) => console.log("[warn]", ...a),
   error: (...a: unknown[]) => console.log("[error]", ...a),
@@ -76,7 +79,7 @@ if (!vs.rebuildVecTables?.(es.getProviderInfo())) {
   console.error("Vector table rebuild failed — aborting.");
   process.exit(1);
 }
-console.log(`Vector tables rebuilt at ${cfg.embedding.dimensions} dims.`);
+console.log("Vector tables rebuilt at the configured dimensions.");
 
 const result = await vs.reindexAll(
   async (text: string) => {

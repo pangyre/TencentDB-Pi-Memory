@@ -378,7 +378,7 @@ export class VectorStore implements IMemoryStore {
    * table — so we SKIP the vec write (metadata + FTS still land) rather than
    * fail or write stale-width vectors. Skipping is always safe: the row is
    * persisted and gets embedded on the next reindex pass. This is the
-   * provably-safe branch of the H1/H2 mandate.
+   * safe fallback branch of the H1/H2 mandate.
    */
   private boundEpoch = 0;
 
@@ -1346,6 +1346,12 @@ export class VectorStore implements IMemoryStore {
       if (this.degraded) this.logger?.warn(`${TAG} [L1-search] SKIPPED (degraded mode)`);
       return [];
     }
+    // P0-2 (round-4 review): a live READER must also honor the epoch guard —
+    // without this, a read-only process keeps MATCHing against a dropped
+    // table after another process rebuilt. Freezing search here makes the
+    // "vector retrieval frozen while pending" guarantee true for readers,
+    // not only writers. Returns empty (keyword/FTS still works).
+    if (this.vecEpochChanged()) return [];
     try {
       // Over-retrieve to compensate for legacy zero-vector placeholders that
       // may still exist in the vec0 table.  New zero vectors are no longer
@@ -1451,7 +1457,10 @@ export class VectorStore implements IMemoryStore {
       this.db.exec("BEGIN");
       try {
         this.stmtDeleteMeta.run(recordId);
-        if (this.vecTablesReady) this.stmtDeleteVec!.run(recordId);
+        // P0-2: epoch guard — after another process rebuilt the vec tables,
+        // this handle's statements are stale-bound; the row does not exist in
+        // the new table, so skipping the vec delete is correct (not a loss).
+        if (this.vecTablesReady && !this.vecEpochChanged()) this.stmtDeleteVec!.run(recordId);
         if (this.ftsAvailable) {
           try { this.stmtL1FtsDelete.run(recordId); } catch { /* non-fatal */ }
         }
@@ -1793,7 +1802,7 @@ export class VectorStore implements IMemoryStore {
    * **Fault-tolerant**: returns an empty array on any error.
    */
   searchL0Vector(queryEmbedding: Float32Array, topK = 5): L0VectorSearchResult[] {
-    if (this.degraded || !this.vecTablesReady) {
+    if (this.degraded || !this.vecTablesReady || this.vecEpochChanged()) {
       if (this.degraded) this.logger?.warn(`${TAG} [L0-search] SKIPPED (degraded mode)`);
       return [];
     }
@@ -1893,7 +1902,8 @@ export class VectorStore implements IMemoryStore {
       this.db.exec("BEGIN");
       try {
         this.stmtL0DeleteMeta.run(recordId);
-        if (this.vecTablesReady) this.stmtL0DeleteVec!.run(recordId);
+        // P0-2 epoch guard (see deleteL1) — row is absent from the new table.
+        if (this.vecTablesReady && !this.vecEpochChanged()) this.stmtL0DeleteVec!.run(recordId);
         if (this.ftsAvailable) {
           try { this.stmtL0FtsDelete.run(recordId); } catch { /* non-fatal */ }
         }

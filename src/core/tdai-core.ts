@@ -52,6 +52,7 @@ import { MemoryPipelineManager } from "../utils/pipeline-manager.js";
 import { CheckpointManager } from "../utils/checkpoint.js";
 import { SessionFilter } from "../utils/session-filter.js";
 import { StandaloneLLMRunnerFactory } from "../adapters/standalone/llm-runner.js";
+import { ReindexLock } from "./store/reindex-lock.js";
 
 const TAG = "[memory-tdai] [core]";
 
@@ -471,119 +472,24 @@ export class TdaiCore {
         // Deliberately not awaited: boot must not block on a full re-embed.
         // Keyword/FTS recall remains available while the background pass runs.
         void (async () => {
-          const lockPath = path.join(this.dataDir, "reindex.lock");
+          const reindexLock = new ReindexLock({
+            dir: this.dataDir,
+            debug: (msg) => this.logger?.info?.(`${TAG} ${msg}`),
+          });
 
-          // D4: single-flight reindex across pi processes sharing the global
-          // store. Atomic acquisition: create a UNIQUE temp file, then link()
-          // it onto the lock path — link(2) is atomic and fails EEXIST if the
-          // lock exists, so two processes can never both hold it (no
-          // unlink-then-create TOCTOU). Steal rules: the lock owner embeds a
-          // random nonce; on takeover we write our own and re-verify ours is
-          // the one on disk. A lock older than 30 minutes is stolen outright
-          // (a reindex takes minutes; 30 min covers pid-recycle and NFS
-          // pid-namespace cases where liveness checks are unreliable).
-          // M2: TTL is a backstop only — a live reindex refreshes the lock
-          // heartbeat every HEARTBEAT_MS, so a stale lock genuinely means the
-          // owner died mid-pass. STALE window comfortably exceeds the
-          // heartbeat interval so we never steal from a live reindex.
-          const HEARTBEAT_MS = 30_000;
-          const LOCK_STALE_MS = 120_000;
-          const myNonce = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-          let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
-
-          const readLockOwner = (): { nonce?: string; ts?: number } | null => {
-            try {
-              return JSON.parse(fs.readFileSync(lockPath, "utf8")) as { nonce?: string; ts?: number };
-            } catch {
-              return null; // vanished between operations — treat as free
-            }
-          };
-
-          const tryAcquire = (): boolean => {
-            const tmpPath = `${lockPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-            try {
-              fs.writeFileSync(tmpPath, JSON.stringify({ nonce: myNonce, pid: process.pid, ts: Date.now() }));
-              // Atomic create-or-fail: link(2) refuses to clobber an existing
-              // lock, so exactly one contender wins.
-              fs.linkSync(tmpPath, lockPath);
-              return true;
-            } catch (err) {
-              const code = (err as NodeJS.ErrnoException).code;
-              if (code !== "EEXIST") {
-                this.logger?.warn?.(
-                  `${TAG} Reindex lock acquisition error (${code ?? "unknown"}): treating as not-acquired.`,
-                );
-              }
-              return false;
-            } finally {
-              try { fs.unlinkSync(tmpPath); } catch { /* temp already gone */ }
-            }
-          };
-
-          const stealStaleLock = (): boolean => {
-            // M1: atomic steal via temp + link. Unlink the stale lock, then
-            // race to link() our OWN unique temp file onto the path. link(2)
-            // is atomic and fails EEXIST, so if two stealers race only one
-            // wins — no truncate-write-read TOCTOU where both read back their
-            // own bytes. The unlink is best-effort; the link is the arbiter.
-            try { fs.unlinkSync(lockPath); } catch { /* already gone / raced */ }
-            const tmpPath = `${lockPath}.${process.pid}.${Math.random().toString(36).slice(2)}.steal.tmp`;
-            try {
-              fs.writeFileSync(tmpPath, JSON.stringify({ nonce: myNonce, pid: process.pid, ts: Date.now() }));
-              fs.linkSync(tmpPath, lockPath);
-              return true;
-            } catch {
-              return false;
-            } finally {
-              try { fs.unlinkSync(tmpPath); } catch { /* temp already gone */ }
-            }
-          };
-
-          const acquireLock = (): boolean => {
-            try {
-              fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-            } catch { /* ignore */ }
-
-            if (tryAcquire()) return true;
-
-            // Lock exists — check staleness.
-            const owner = readLockOwner();
-            const age = owner?.ts ? Date.now() - owner.ts : Infinity;
-            if (age > LOCK_STALE_MS) {
-              this.logger?.info?.(
-                `${TAG} Reindex lock stale (age ${Math.round(age / 60000)}min) — stealing.`,
-              );
-              return stealStaleLock();
-            }
-            return false; // held by a live recent owner — skip
-          };
-
-          const releaseLock = (): void => {
-            // Only remove the lock if WE still own it (nonce check) — never
-            // clobber a successor's lock.
-            try {
-              const owner = readLockOwner();
-              if (owner?.nonce === myNonce) fs.unlinkSync(lockPath);
-            } catch { /* best-effort */ }
-          };
-
-          if (!acquireLock()) {
+          // D4: single-flight across pi processes sharing the global store.
+          // The destructive drop+rebuild happens only after this lock AND
+          // approval AND embedding readiness (D5/D3) — see reindex-lock.ts.
+          if (!reindexLock.tryAcquire()) {
             this.logger?.info?.(
               `${TAG} Reindex lock held by another live process — skipping (they will mark embedding current).`,
             );
             return;
           }
 
-          // M2: refresh the heartbeat ts while WE own the lock so other
-          // processes' TTL backstop never steals from a live reindex.
-          heartbeatTimer = setInterval(() => {
-            try {
-              const owner = readLockOwner();
-              if (owner?.nonce !== myNonce) return; // no longer ours — stop touching it
-              fs.writeFileSync(lockPath, JSON.stringify({ nonce: myNonce, pid: process.pid, ts: Date.now() }));
-            } catch { /* best-effort heartbeat */ }
-          }, HEARTBEAT_MS);
-          heartbeatTimer.unref?.();
+          // Heartbeat: refresh the lock ts during long passes so the TTL
+          // backstop never steals from a live reindex (M2).
+          const heartbeat = setInterval(() => reindexLock.heartbeat(), 60_000);
 
           try {
             // D3: local providers must be warm before embed() works.
@@ -650,8 +556,8 @@ export class TdaiCore {
                 `${err instanceof Error ? err.message : String(err)}`,
             );
           } finally {
-            if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
-            releaseLock();
+            clearInterval(heartbeat);
+            reindexLock.release();
           }
         })();
       }
