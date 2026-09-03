@@ -368,6 +368,20 @@ export class VectorStore implements IMemoryStore {
   private reindexPending = false;
   private reindexPendingReason: string | undefined;
 
+  /**
+   * Cross-process schema epoch (H1/H2). Persisted in embedding_meta under
+   * key `schema_epoch` and bumped by every rebuildVecTables(). Each live
+   * process caches the epoch its vec-write prepared statements were bound to
+   * (`boundEpoch`). Before any vec write we compare the on-disk epoch against
+   * boundEpoch via `vecEpochChanged()`; if another process rebuilt the vec
+   * tables under us, our prepared INSERT statements are bound to a dropped
+   * table — so we SKIP the vec write (metadata + FTS still land) rather than
+   * fail or write stale-width vectors. Skipping is always safe: the row is
+   * persisted and gets embedded on the next reindex pass. This is the
+   * provably-safe branch of the H1/H2 mandate.
+   */
+  private boundEpoch = 0;
+
   // Prepared statements — L1 (initialized in init())
   private stmtUpsertMeta!: StatementSync;
   private stmtDeleteVec?: StatementSync;   // optional — only set when vecTablesReady
@@ -534,13 +548,29 @@ export class VectorStore implements IMemoryStore {
           if (dimsChanged) reasons.push(`dimensions: ${savedMeta.dimensions} → ${this.dimensions}`);
           reindexReason = reasons.join(", ");
 
-          this.logger?.info(
-            `${TAG} Embedding config changed (${reindexReason}). ` +
-            `Vector tables left intact; rebuild deferred until the reindex runs ` +
-            `(reindex.approveChanges).`,
-          );
-          needsReindex = true;
-          this.reindexPending = true;
+          // H3 generalization: if the DB is EMPTY, no config change is
+          // destructive — there is nothing to re-embed. Recreate the (possibly
+          // stale-width) vec tables cleanly at init and mark meta current, so
+          // an empty store never enters the per-boot warn loop.
+          const l1Count = this.tableRowCount("l1_records");
+          const l0Count = this.tableRowCount("l0_conversations");
+          if (l1Count === 0 && l0Count === 0) {
+            this.logger?.info(
+              `${TAG} Embedding config changed (${reindexReason}) but DB is empty ` +
+              `(L1=0, L0=0) — nothing to re-embed; recreating vec tables, no reindex needed.`,
+            );
+            this.dropVectorTables();
+            // needsReindex stays false → vec tables re-created below at the
+            // new width and meta written as current.
+          } else {
+            this.logger?.info(
+              `${TAG} Embedding config changed (${reindexReason}). ` +
+              `Vector tables left intact; rebuild deferred until the reindex runs ` +
+              `(reindex.approveChanges).`,
+            );
+            needsReindex = true;
+            this.reindexPending = true;
+          }
         }
       } else {
         // No saved meta — first run or legacy DB without meta table.
@@ -564,13 +594,21 @@ export class VectorStore implements IMemoryStore {
         } else if (existingVecDims !== null && existingVecDims !== this.dimensions) {
           // vec0 tables exist (from a previous provider="none" placeholder or
           // different config) but with mismatched dimensions.
-          this.logger?.info(
+          //
+          // H3: only treat this as a reindex if there is actually data to
+          // re-embed. We reach this branch only when L1=0 AND L0=0 (the
+          // rows>0 case is handled above), so there is NOTHING to re-embed —
+          // the mismatched empty vec tables can simply be recreated at the
+          // right width during normal init below. Marking needsReindex here
+          // caused a per-boot warning forever on empty DBs (the pre-existing
+          // "nothing to re-embed" behavior was correct). Leave needsReindex
+          // false and reindexPending false so init recreates l1_vec cleanly.
+          this.logger?.debug?.(
             `${TAG} vec0 table dimension mismatch (existing=${existingVecDims}, ` +
-            `required=${this.dimensions}). Rebuild deferred until the reindex runs.`,
+            `required=${this.dimensions}) but DB is empty (L1=0, L0=0) — nothing to ` +
+            `re-embed; recreating vec tables at the required width, no reindex needed.`,
           );
-          needsReindex = true;
-          this.reindexPending = true;
-          reindexReason = "vec0 dimension mismatch";
+          this.dropVectorTables();
         }
       }
     }
@@ -877,6 +915,10 @@ export class VectorStore implements IMemoryStore {
     // Mark vec0 tables as ready only when they were actually created AND no
     // rebuild is pending (pending tables may hold stale-width vectors).
     this.vecTablesReady = this.dimensions > 0 && !this.reindexPending;
+    // Bind our vec-write epoch to whatever is currently on disk (H1/H2). Any
+    // subsequent rebuild — ours or another process's — bumps this and our
+    // vecEpochChanged() guard trips before the next vec write.
+    this.boundEpoch = this.readSchemaEpoch();
     // L1 query statements (for l1-reader)
     const l1QueryCols = `record_id, content, type, priority, scene_name, session_key, session_id,
       timestamp_str, timestamp_start, timestamp_end,
@@ -931,6 +973,56 @@ export class VectorStore implements IMemoryStore {
 
   // ── Embedding meta helpers ──────────────────────────────
 
+  /**
+   * Read the persisted cross-process schema epoch (0 if absent). Cheap
+   * single-row read — called before each vec write to detect a rebuild that
+   * happened under a live process (H1/H2).
+   */
+  private readSchemaEpoch(): number {
+    try {
+      const row = this.db
+        .prepare("SELECT value FROM embedding_meta WHERE key = ?")
+        .get("schema_epoch") as { value: string } | undefined;
+      if (!row) return 0;
+      const n = Number(row.value);
+      return Number.isFinite(n) ? n : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private writeSchemaEpoch(epoch: number): void {
+    try {
+      this.db.prepare(
+        "INSERT INTO embedding_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      ).run("schema_epoch", String(epoch));
+    } catch { /* best-effort */ }
+  }
+
+  /**
+   * True when another live process rebuilt the vec tables since we prepared
+   * our vec statements (on-disk epoch advanced past boundEpoch). When true,
+   * callers MUST skip the vec write — our stmtInsertVec is bound to a dropped
+   * table. Metadata + FTS writes remain safe. Self-heals boundEpoch so we
+   * only warn once per rebuild.
+   */
+  private vecEpochChanged(): boolean {
+    const disk = this.readSchemaEpoch();
+    if (disk !== this.boundEpoch) {
+      this.logger?.warn?.(
+        `${TAG} Vec schema epoch advanced under this process ` +
+        `(bound=${this.boundEpoch}, disk=${disk}) — another process rebuilt the ` +
+        `vector tables. Skipping vec writes and freezing vector search until ` +
+        `re-init; rows are persisted (metadata + FTS) and will be embedded on ` +
+        `the next reindex pass.`,
+      );
+      this.boundEpoch = disk;
+      this.vecTablesReady = false;
+      return true;
+    }
+    return false;
+  }
+
   private readEmbeddingMeta(): EmbeddingMeta | null {
     try {
       const row = this.db
@@ -957,10 +1049,23 @@ export class VectorStore implements IMemoryStore {
    */
   markEmbeddingCurrent(providerInfo: EmbeddingProviderInfo): void {
     if (!providerInfo) return;
+    // H2: all three meta fields from one coherent source. The provider/model
+    // come from the service that embedded; dimensions come from the tables we
+    // just rebuilt (this.dimensions) — if the service reports a different
+    // width, that is a config inconsistency: warn loudly and record the
+    // table truth, so the mismatch is visible in the meta instead of silent.
+    const dims = providerInfo.dimensions ?? this.dimensions;
+    if (providerInfo.dimensions != null && providerInfo.dimensions !== this.dimensions) {
+      this.logger?.warn(
+        `${TAG} markEmbeddingCurrent: provider reported ${providerInfo.dimensions} dims ` +
+          `but vector tables are ${this.dimensions} — recording table width. ` +
+          `Check embedding.dimensions in config.`,
+      );
+    }
     this.writeEmbeddingMeta({
       provider: providerInfo.provider,
       model: providerInfo.model,
-      dimensions: this.dimensions,
+      dimensions: dims,
     });
   }
 
@@ -1029,6 +1134,15 @@ export class VectorStore implements IMemoryStore {
           AND k = ?
         ORDER BY distance
       `);
+
+      // Bump the cross-process schema epoch so any OTHER live process
+      // detects (via vecEpochChanged before its next vec write) that the vec
+      // tables it holds prepared statements against were dropped+recreated
+      // under it (H1/H2). We bind our own boundEpoch to the new value so our
+      // fresh statements are considered current.
+      const nextEpoch = this.readSchemaEpoch() + 1;
+      this.writeSchemaEpoch(nextEpoch);
+      this.boundEpoch = nextEpoch;
 
       this.reindexPending = false;
       this.vecTablesReady = true;
@@ -1136,7 +1250,7 @@ export class VectorStore implements IMemoryStore {
           ? timestamps.reduce((a, b) => (a > b ? a : b))
           : tsStr;
 
-      const skipVec = !embedding || embedding.every(v => v === 0) || !this.vecTablesReady;
+      const skipVec = !embedding || embedding.every(v => v === 0) || !this.vecTablesReady || this.vecEpochChanged();
 
       this.logger?.debug?.(
         `${TAG} [L1-upsert] START id=${recordId}, type=${record.type}, ` +
@@ -1554,7 +1668,7 @@ export class VectorStore implements IMemoryStore {
       return false;
     }
     try {
-      const skipVec = !embedding || embedding.every(v => v === 0) || !this.vecTablesReady;
+      const skipVec = !embedding || embedding.every(v => v === 0) || !this.vecTablesReady || this.vecEpochChanged();
 
       this.logger?.debug?.(
         `${TAG} [L0-upsert] START id=${record.id}, session=${record.sessionKey}, role=${record.role}, ` +
@@ -1931,6 +2045,9 @@ export class VectorStore implements IMemoryStore {
    * @param embedFn  A function that converts text → Float32Array embedding.
    * @param onProgress  Optional callback for progress reporting.
    */
+  // NOTE (IMemoryStore compat / P3): the onProgress callback signature is
+  // (succeeded, failed, total, layer) and reindexAll resolves with per-layer
+  // {count,failed,total}. External IMemoryStore implementers must match this.
   async reindexAll(
     embedFn: (text: string) => Promise<Float32Array>,
     onProgress?: (succeeded: number, failed: number, total: number, layer: "L1" | "L0") => void,

@@ -61,6 +61,14 @@ export interface EmbeddingProviderInfo {
   provider: string;
   /** Model identifier (e.g. "embeddinggemma-300m", "text-embedding-3-large") */
   model: string;
+  /**
+   * Vector dimensions the provider emits (H2). Populated by services that
+   * know their own width (local model constant, configured remote dims).
+   * Optional for backward compatibility with external implementers; the
+   * vector store's table width remains the ground truth for stored vectors
+   * and a disagreement is warned about when the meta is marked current.
+   */
+  dimensions?: number;
 }
 
 export interface EmbeddingCallOptions {
@@ -187,7 +195,7 @@ export class LocalEmbeddingService implements EmbeddingService {
   }
 
   getProviderInfo(): EmbeddingProviderInfo {
-    return { provider: "local", model: this.modelPath };
+    return { provider: "local", model: this.modelPath, dimensions: LOCAL_DIMENSIONS };
   }
 
   /**
@@ -539,7 +547,7 @@ export class OpenAIEmbeddingService implements EmbeddingService {
   }
 
   getProviderInfo(): EmbeddingProviderInfo {
-    return { provider: this.providerName, model: this.model };
+    return { provider: this.providerName, model: this.model, dimensions: this.dims };
   }
 
   /** Remote embedding is always ready (stateless HTTP). */

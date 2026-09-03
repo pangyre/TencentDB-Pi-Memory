@@ -43,7 +43,24 @@ if (!vs || !es) {
 
 console.log(`Store ready. needsReindex flag: ${stores.needsReindex} (${stores.reindexReason ?? "none"})`);
 
-// Warm up the remote embedding service (stateless HTTP, so mostly a no-op).
+// D3 readiness (M4): local (node-llama-cpp) providers must be warm before
+// embed() succeeds. The sanctioned approval tool MUST apply the same wait as
+// the background reindex path — otherwise for local providers this script
+// drops the tables then embed-fails-empty. Warm up and wait for isReady()
+// BEFORE the destructive rebuild.
+if (!es.isReady()) {
+  console.log("Waiting for embedding service readiness before reindex...");
+  es.startWarmup();
+  const readyAt = Date.now() + 5 * 60 * 1000; // 5 min for model download+load
+  while (!es.isReady()) {
+    if (Date.now() > readyAt) {
+      console.error("Embedding service not ready after 5min — aborting reindex (tables untouched).");
+      process.exit(1);
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+}
+// Remote providers are stateless HTTP; a warmup embed is a cheap no-op there.
 try {
   await es.embed("warmup");
 } catch {
