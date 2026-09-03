@@ -55,7 +55,7 @@ export class ReindexLock {
   private readonly lockPath: string;
   private readonly maxAgeMs: number;
   private readonly debug?: (msg: string) => void;
-  private readonly nonce: string;
+  private readonly ownerNonce: string;
   private held = false;
 
   constructor(opts: ReindexLockOptions) {
@@ -63,11 +63,12 @@ export class ReindexLock {
     this.maxAgeMs = opts.maxAgeMs ?? DEFAULT_MAX_AGE_MS;
     this.debug = opts.debug;
     // Nonce identifies THIS holder instance, even across pid reuse.
-    this.nonce = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    this.ownerNonce = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
 
-  get held(): boolean {
-    return this.held;
+  /** This holder instance's nonce (identity for release/steal bookkeeping). */
+  get nonce(): string {
+    return this.ownerNonce;
   }
 
   private readOwner(): LockPayload | null {
@@ -80,9 +81,9 @@ export class ReindexLock {
 
   /** Atomic create-or-fail: write a unique temp file, link(2) onto the lock. */
   private createLockFile(): boolean {
-    const tmp = `${this.lockPath}.${this.nonce}.tmp`;
+    const tmp = `${this.lockPath}.${this.ownerNonce}.tmp`;
     try {
-      fs.writeFileSync(tmp, JSON.stringify({ nonce: this.nonce, pid: process.pid, ts: Date.now() }));
+      fs.writeFileSync(tmp, JSON.stringify({ nonce: this.ownerNonce, pid: process.pid, ts: Date.now() }));
       // link(2) is atomic and fails EEXIST if the lock already exists —
       // exactly one contender can ever create the lock.
       fs.linkSync(tmp, this.lockPath);
@@ -105,13 +106,13 @@ export class ReindexLock {
   private stealStale(): boolean {
     try {
       const fd = fs.openSync(this.lockPath, "w");
-      fs.writeSync(fd, JSON.stringify({ nonce: this.nonce, pid: process.pid, ts: Date.now() }));
+      fs.writeSync(fd, JSON.stringify({ nonce: this.ownerNonce, pid: process.pid, ts: Date.now() }));
       fs.closeSync(fd);
     } catch {
       return false;
     }
     const owner = this.readOwner();
-    if (owner?.nonce !== this.nonce) return false;
+    if (owner?.nonce !== this.ownerNonce) return false;
     this.held = true;
     return true;
   }
@@ -146,9 +147,9 @@ export class ReindexLock {
     if (!this.held) return;
     try {
       const owner = this.readOwner();
-      if (owner?.nonce !== this.nonce) return; // lost the lock — do not clobber
+      if (owner?.nonce !== this.ownerNonce) return; // lost the lock — do not clobber
       const fd = fs.openSync(this.lockPath, "w");
-      fs.writeSync(fd, JSON.stringify({ nonce: this.nonce, pid: process.pid, ts: Date.now() }));
+      fs.writeSync(fd, JSON.stringify({ nonce: this.ownerNonce, pid: process.pid, ts: Date.now() }));
       fs.closeSync(fd);
     } catch { /* best-effort */ }
   }
@@ -161,7 +162,7 @@ export class ReindexLock {
     if (!this.held) return;
     try {
       const owner = this.readOwner();
-      if (owner?.nonce === this.nonce) fs.unlinkSync(this.lockPath);
+      if (owner?.nonce === this.ownerNonce) fs.unlinkSync(this.lockPath);
     } catch { /* best-effort */ }
     this.held = false;
   }
