@@ -21,8 +21,10 @@ scripts/export-tencent-vdb/dist/
 scripts/migrate-sqlite-to-tcvdb/dist/
 scripts/read-local-memory/dist/
 
-# Root-level build output (not used at runtime, not published)
-dist/
+# Root-level plugin build output — COMMITTED because pi installs this package as a
+# git dependency with `npm install --omit=dev`, so tsdown (a devDependency) can
+# never run at install time. dist/index.mjs is what pi loads at runtime; rebuild
+# (npm run build:plugin) and commit it alongside every source change.
 
 node_modules/
 benchmark-runs/

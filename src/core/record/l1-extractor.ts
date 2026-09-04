@@ -302,14 +302,17 @@ async function callLlmExtractionOnce(params: {
   model?: string;
   /** Host-neutral LLM runner — when provided, used instead of CleanContextRunner. */
   llmRunner?: LLMRunner;
+  /** Appended to the user prompt on a retry, steering the model back to pure JSON. */
+  repairHint?: string;
 }): Promise<string> {
-  const { newMessages, backgroundMessages, previousSceneName, config, logger, model, llmRunner } = params;
+  const { newMessages, backgroundMessages, previousSceneName, config, logger, model, llmRunner, repairHint } = params;
 
-  const userPrompt = formatExtractionPrompt({
-    newMessages,
-    backgroundMessages,
-    previousSceneName,
-  });
+  const userPrompt =
+    formatExtractionPrompt({
+      newMessages,
+      backgroundMessages,
+      previousSceneName,
+    }) + (repairHint ?? "");
 
   // [l1-debug] ENTRY — what are we about to ask the LLM to extract?
   logger?.debug?.(
@@ -343,20 +346,50 @@ async function callLlmExtractionOnce(params: {
     });
   }
 
-  return result;
+  return normalizeLlmText(result);
 }
 
-const LLM_EMPTY_RETRY_LIMIT = 1;
+const LLM_RETRY_LIMIT = 1;
 
 /**
- * LLM extraction with empty-response retry.
+ * Normalize whatever the host LLM runner returned into plain text.
  *
- * deepseek-v4-flash intermittently returns an EMPTY string to the extraction
- * prompt (observed ~100x over a month of logs: `NO_JSON ... rawLen=0`). The
- * old path treated that as "nothing memorable", advanced the cursor, and the
- * batch's memories were silently lost. An empty response is a TRANSPORT/serve
- * flake, not a judgment — retry it. A non-empty response that legitimately
- * parses to `[]` (the LLM found nothing worth extracting) is NOT retried.
+ * The runner is documented to return a string, but in practice it can return
+ * an object ({ content, ... }) or null on some providers/reasoning paths. A
+ * `.trim()` on a non-string must never take L1 capture down.
+ */
+function normalizeLlmText(result: unknown): string {
+  if (typeof result === "string") return result;
+  if (result && typeof result === "object") {
+    const o = result as { content?: unknown; text?: unknown; message?: { content?: unknown } };
+    if (typeof o.content === "string") return o.content;
+    if (typeof o.text === "string") return o.text;
+    if (typeof o.message?.content === "string") return o.message.content;
+  }
+  return String(result ?? "");
+}
+
+const RETRY_REPAIR_HINT =
+  "\n\n[SYSTEM] Your previous reply was empty or not valid JSON, so it could not be " +
+  "parsed. Return ONLY a single valid JSON array matching the requested schema " +
+  "(array of {scene_name, message_ids, memories}), with no markdown fences, no " +
+  "prose, and no trailing text.";
+
+/**
+ * LLM extraction with retry.
+ *
+ * deepseek-v4-flash intermittently flakes on this prompt in two observable
+ * ways: (1) an EMPTY string (transport/serve flake — observed ~100x over a
+ * month of logs: `NO_JSON ... rawLen=0`), and (2) non-empty but MALFORMED
+ * JSON (e.g. unescaped quotes/newlines inside a memory string — "Expected ','
+ * or '}' after property value").
+ *
+ * Neither is a judgment, so both are retried once WITH a repair hint appended
+ * to the prompt. A response that legitimately parses to `[]` (the LLM found
+ * nothing worth extracting) IS a judgment and is NOT retried. If the retry
+ * also fails, parseExtractionResult has already logged the raw payload
+ * ([l1-debug] PARSE_FAIL / NO_JSON) and the batch self-heals because the
+ * pipeline re-presents it on later cycles.
  */
 async function callLlmExtractionWithRetry(params: {
   newMessages: ConversationMessage[];
@@ -369,37 +402,31 @@ async function callLlmExtractionWithRetry(params: {
 }): Promise<SceneSegment[]> {
   const { logger } = params;
 
-  for (let attempt = 1; attempt <= 1 + LLM_EMPTY_RETRY_LIMIT; attempt++) {
-    const result = await callLlmExtractionOnce(params);
-    const cleaned = result.trim();
-    const stripped = cleaned
-      .replace(/^```(?:json)?\s*\n?/, "")
-      .replace(/\n?```\s*$/, "")
-      .trim();
+  for (let attempt = 1; attempt <= 1 + LLM_RETRY_LIMIT; attempt++) {
+    const raw = await callLlmExtractionOnce({
+      ...params,
+      ...(attempt > 1 ? { repairHint: RETRY_REPAIR_HINT } : {}),
+    });
 
-    // Genuinely-empty extraction: the LLM answered with a valid empty array —
-    // a judgment, not a failure. No retry.
-    if (/^\[\s*\]$/.test(stripped)) {
-      return [];
+    const parsed = parseExtractionResult(raw, logger);
+    if (parsed !== null) {
+      return parsed;
     }
 
-    // Empty or unparseable response — transient serve flake. Retry.
-    if (cleaned.length === 0 || !cleaned.includes("[")) {
-      if (attempt <= LLM_EMPTY_RETRY_LIMIT) {
-        logger?.info?.(
-          `${TAG} Empty extraction response (attempt ${attempt}/${1 + LLM_EMPTY_RETRY_LIMIT}, len=${cleaned.length}) — retrying. ` +
-            `(If retries fail, the pipeline re-presents this batch on later cycles.)`,
-        );
-        await new Promise((r) => setTimeout(r, 2_000 * attempt));
-        continue;
-      }
+    if (attempt <= LLM_RETRY_LIMIT) {
       logger?.info?.(
-        `${TAG} Extraction empty after ${attempt} attempts — deferring. The pipeline ` +
-          `re-presents this batch on later cycles, so nothing is lost.`,
+        `${TAG} Empty or malformed extraction response (attempt ${attempt}/${1 + LLM_RETRY_LIMIT}, rawLen=${raw.length}) — retrying with repair hint. ` +
+          `(If retries fail, the pipeline re-presents this batch on later cycles.)`,
       );
+      await new Promise((r) => setTimeout(r, 2_000 * attempt));
+      continue;
     }
 
-    return parseExtractionResult(result, logger);
+    logger?.info?.(
+      `${TAG} Extraction unparseable after ${attempt} attempts — deferring. The pipeline ` +
+        `re-presents this batch on later cycles, so nothing is lost.`,
+    );
+    return [];
   }
 
   return []; // unreachable
@@ -408,11 +435,17 @@ async function callLlmExtractionWithRetry(params: {
 /**
  * Parse the LLM's JSON response into SceneSegment array.
  * Expected format: [{scene_name, message_ids, memories: [...]}]
+ *
+ * Returns `null` when the response is empty or structurally unparseable (the
+ * caller retries those), and `[]` for a valid empty array (a judgment that
+ * nothing is worth extracting). Always logs the raw payload on failure so the
+ * exact model output is recoverable.
  */
-function parseExtractionResult(raw: string, logger?: Logger): SceneSegment[] {
+function parseExtractionResult(raw: unknown, logger?: Logger): SceneSegment[] | null {
+  const text = normalizeLlmText(raw);
   try {
     // Strip markdown code block wrappers if present
-    let cleaned = raw.trim();
+    let cleaned = text.trim();
     if (cleaned.startsWith("```")) {
       cleaned = cleaned.replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "");
     }
@@ -420,16 +453,15 @@ function parseExtractionResult(raw: string, logger?: Logger): SceneSegment[] {
     // Try to extract JSON array
     const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
     if (!arrayMatch) {
-      // Self-healing: an empty/unparseable response is retried here and the
-      // pipeline re-presents the batch on later cycles — informational, not
-      // an alarm. Kept visible (info) because persistent occurrences would
-      // still deserve attention.
-      logger?.info?.(`${TAG} No JSON array found in extraction response (batch will be re-attempted)`);
-      const rawPreview = raw.slice(0, 2048);
+      // Empty/unparseable — the caller retries; the pipeline also re-presents
+      // the batch on later cycles. Informational, not an alarm, but kept
+      // visible because persistent occurrences deserve attention.
+      logger?.info?.(`${TAG} No JSON array found in extraction response (will retry)`);
+      const rawPreview = text.slice(0, 2048);
       logger?.info?.(
-        `${TAG} [l1-debug] NO_JSON taskId=l1-extraction, rawLen=${raw.length}, cleanedLen=${cleaned.length}, rawFull=${JSON.stringify(rawPreview)}${raw.length > 2048 ? `…(+${raw.length - 2048})` : ""}`,
+        `${TAG} [l1-debug] NO_JSON taskId=l1-extraction, rawLen=${text.length}, cleanedLen=${cleaned.length}, rawFull=${JSON.stringify(rawPreview)}${text.length > 2048 ? `…(+${text.length - 2048})` : ""}`,
       );
-      return [];
+      return null;
     }
 
     // Sanitize control characters inside JSON string literals that LLM may produce
@@ -438,7 +470,7 @@ function parseExtractionResult(raw: string, logger?: Logger): SceneSegment[] {
 
     if (!Array.isArray(parsed)) {
       logger?.warn?.(`${TAG} Extraction response is not an array`);
-      return [];
+      return null;
     }
 
     const scenes: SceneSegment[] = [];
@@ -465,8 +497,13 @@ function parseExtractionResult(raw: string, logger?: Logger): SceneSegment[] {
 
     return scenes;
   } catch (err) {
-    logger?.warn?.(`${TAG} Failed to parse extraction result: ${err instanceof Error ? err.message : String(err)}`);
-    return [];
+    const message = err instanceof Error ? err.message : String(err);
+    logger?.warn?.(`${TAG} Failed to parse extraction result: ${message}`);
+    const rawPreview = text.slice(0, 2048);
+    logger?.warn?.(
+      `${TAG} [l1-debug] PARSE_FAIL taskId=l1-extraction, rawLen=${text.length}, rawPreview=${JSON.stringify(rawPreview)}${text.length > 2048 ? `…(+${text.length - 2048})` : ""}`,
+    );
+    return null;
   }
 }
 
