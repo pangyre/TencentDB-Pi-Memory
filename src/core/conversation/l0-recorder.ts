@@ -103,8 +103,16 @@ export async function recordConversation(params: {
    * AFTER before_prompt_build, i.e. the one whose content was polluted by prependContext.
    */
   originalUserMessageCount?: number;
+  /**
+   * True when the host delivers ONLY this turn's new messages (e.g. pi's
+   * agent_end event), never full session history. The position slice cannot
+   * apply by construction, and every message passing the timestamp cursor is
+   * the expected steady state — the safety valve's timestamp-drift warning is
+   * demoted to debug for such hosts.
+   */
+  messagesAreTurnScoped?: boolean;
 }): Promise<ConversationMessage[]> {
-  const { sessionKey, sessionId, rawMessages, baseDir, logger, originalUserText, afterTimestamp, originalUserMessageCount } = params;
+  const { sessionKey, sessionId, rawMessages, baseDir, logger, originalUserText, afterTimestamp, originalUserMessageCount, messagesAreTurnScoped } = params;
 
   // Step 1: Position slice + extract user/assistant messages.
   //
@@ -174,11 +182,22 @@ export async function recordConversation(params: {
 
     // Safety valve: if timestamp filter passed everything through and position slice
     // was not available, this likely indicates timestamp drift after a gateway restart.
+    // Turn-scoped hosts (messagesAreTurnScoped) legitimately hit this state on every
+    // large turn — the slice is structurally N/A and all-new is the steady state, so
+    // log at debug instead of warning.
     if (!usePositionSlice && extracted.length === allExtracted.length && allExtracted.length > 8) {
-      logger?.warn?.(
-        `${TAG} ⚠ Safety valve: all ${allExtracted.length} messages passed timestamp filter (cursor=${cursor}) — ` +
-        `possible timestamp drift after gateway restart. Position slice was not available (no cached messageCount).`,
-      );
+      if (messagesAreTurnScoped) {
+        logger?.debug?.(
+          `${TAG} All ${allExtracted.length} messages passed timestamp filter (cursor=${cursor}) — ` +
+          `expected for turn-scoped messages; no drift check needed.`,
+        );
+      }
+      else {
+        logger?.warn?.(
+          `${TAG} ⚠ Safety valve: all ${allExtracted.length} messages passed timestamp filter (cursor=${cursor}) — ` +
+          `possible timestamp drift after gateway restart. Position slice was not available (no cached messageCount).`,
+        );
+      }
     }
   }
 

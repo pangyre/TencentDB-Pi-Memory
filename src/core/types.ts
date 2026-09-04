@@ -189,6 +189,14 @@ export interface CompletedTurn {
    * polluted by prependContext injection.
    */
   originalUserMessageCount?: number;
+  /**
+   * True when the host delivers ONLY this turn's new messages (e.g. pi's
+   * agent_end event), never full session history. The position slice is
+   * structurally unavailable in that case, and every message passing the
+   * timestamp cursor is the expected steady state — the L0 safety valve's
+   * timestamp-drift warning is demoted to debug.
+   */
+  messagesAreTurnScoped?: boolean;
 }
 
 // ============================

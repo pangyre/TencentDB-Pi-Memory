@@ -58,6 +58,13 @@ export async function performAutoCapture(params: {
    * corresponds to: rawMessages[originalUserMessageCount] is the polluted user message.
    */
   originalUserMessageCount?: number;
+  /**
+   * True when the host delivers ONLY this turn's new messages (pi agent_end),
+   * never full session history. The position slice is structurally unavailable
+   * and every message passing the cursor is expected — suppresses the L0
+   * safety-valve timestamp-drift warning.
+   */
+  messagesAreTurnScoped?: boolean;
   /** Epoch ms when the plugin was registered (cold-start time).
    *  Used as fallback cursor when checkpoint has no prior timestamp —
    *  prevents the first agent_end from dumping all session history into L0. */
@@ -85,7 +92,7 @@ export async function performAutoCapture(params: {
 }): Promise<AutoCaptureResult> {
   const {
     messages, sessionKey, sessionId, cfg, pluginDataDir, logger, scheduler,
-    originalUserText, originalUserMessageCount, pluginStartTimestamp,
+    originalUserText, originalUserMessageCount, pluginStartTimestamp, messagesAreTurnScoped,
     vectorStore, embeddingService, bgTaskRegistry,
   } = params;
   const tCaptureStart = performance.now();
@@ -125,6 +132,7 @@ export async function performAutoCapture(params: {
           originalUserText,
           afterTimestamp,
           originalUserMessageCount,
+          messagesAreTurnScoped,
         });
 
         if (filteredMessages.length === 0) {

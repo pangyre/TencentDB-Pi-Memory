@@ -9079,7 +9079,7 @@ const TAG$24 = "[memory-tdai][l0]";
 * @returns Filtered messages (for L1 to use directly), or empty array if nothing worth recording
 */
 async function recordConversation(params) {
-	const { sessionKey, sessionId, rawMessages, baseDir, logger, originalUserText, afterTimestamp, originalUserMessageCount } = params;
+	const { sessionKey, sessionId, rawMessages, baseDir, logger, originalUserText, afterTimestamp, originalUserMessageCount, messagesAreTurnScoped } = params;
 	const usePositionSlice = originalUserMessageCount != null && originalUserMessageCount > 0 && originalUserMessageCount <= rawMessages.length;
 	const slicedMessages = usePositionSlice ? rawMessages.slice(originalUserMessageCount) : rawMessages;
 	const allExtracted = extractUserAssistantMessages(slicedMessages);
@@ -9098,7 +9098,8 @@ async function recordConversation(params) {
 	}
 	if (cursor > 0) {
 		logger?.debug?.(`${TAG$24} Incremental filter: ${allExtracted.length} total → ${extracted.length} new (cursor=${cursor})`);
-		if (!usePositionSlice && extracted.length === allExtracted.length && allExtracted.length > 8) logger?.warn?.(`${TAG$24} ⚠ Safety valve: all ${allExtracted.length} messages passed timestamp filter (cursor=${cursor}) — possible timestamp drift after gateway restart. Position slice was not available (no cached messageCount).`);
+		if (!usePositionSlice && extracted.length === allExtracted.length && allExtracted.length > 8) if (messagesAreTurnScoped) logger?.debug?.(`${TAG$24} All ${allExtracted.length} messages passed timestamp filter (cursor=${cursor}) — expected for turn-scoped messages; no drift check needed.`);
+		else logger?.warn?.(`${TAG$24} ⚠ Safety valve: all ${allExtracted.length} messages passed timestamp filter (cursor=${cursor}) — possible timestamp drift after gateway restart. Position slice was not available (no cached messageCount).`);
 	}
 	if (extracted.length === 0) {
 		logger?.debug?.(`${TAG$24} No new user/assistant messages to record`);
@@ -9333,7 +9334,7 @@ function generateL0RecordId(sessionKey, index) {
 	return `l0_${sessionKey}_${Date.now()}_${index}_${crypto.randomBytes(3).toString("hex")}`;
 }
 async function performAutoCapture(params) {
-	const { messages, sessionKey, sessionId, cfg, pluginDataDir, logger, scheduler, originalUserText, originalUserMessageCount, pluginStartTimestamp, vectorStore, embeddingService, bgTaskRegistry } = params;
+	const { messages, sessionKey, sessionId, cfg, pluginDataDir, logger, scheduler, originalUserText, originalUserMessageCount, pluginStartTimestamp, messagesAreTurnScoped, vectorStore, embeddingService, bgTaskRegistry } = params;
 	const tCaptureStart = performance.now();
 	const checkpoint = new CheckpointManager(pluginDataDir, logger);
 	const tL0RecordStart = performance.now();
@@ -9350,7 +9351,8 @@ async function performAutoCapture(params) {
 				logger,
 				originalUserText,
 				afterTimestamp,
-				originalUserMessageCount
+				originalUserMessageCount,
+				messagesAreTurnScoped
 			});
 			if (filteredMessages.length === 0) return null;
 			logger?.debug?.(`${TAG$23} L0 recorded: ${filteredMessages.length} messages for session ${sessionKey}`);
@@ -18667,6 +18669,7 @@ var TdaiCore = class {
 			scheduler: this.scheduler,
 			originalUserText: turn.userText,
 			originalUserMessageCount: turn.originalUserMessageCount,
+			messagesAreTurnScoped: turn.messagesAreTurnScoped,
 			pluginStartTimestamp: turn.startedAt ?? Date.now(),
 			vectorStore: this.vectorStore,
 			embeddingService: this.embeddingService,

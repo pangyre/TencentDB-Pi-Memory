@@ -192,6 +192,10 @@ export default function (pi: ExtensionAPI) {
         sessionKey,
         sessionId: safeGetSessionId(ctx),
         startedAt: extensionLoadTs,
+        // pi's agent_end delivers only this run's messages (never full session
+        // history), so the L0 position slice is structurally N/A and the safety
+        // valve's drift warning would false-positive on every large turn.
+        messagesAreTurnScoped: true,
       });
       logger.debug?.(
         `captured l0=${result.l0RecordedCount} vectors=${result.l0VectorsWritten} ` +
