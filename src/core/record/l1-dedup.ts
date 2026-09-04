@@ -23,6 +23,26 @@ import type { LLMRunner, Logger } from "../types.js";
 
 const TAG = "[memory-tdai][l1-dedup]";
 
+/**
+ * Max extra LLM attempts after the first response is empty/unparseable.
+ * deepseek-v4-flash intermittently returns an EMPTY string to the conflict
+ * detection prompt (transport/serve flake — same disease as extraction, see
+ * l1-extractor). An empty/unparseable response is not a judgment, so it is
+ * retried once WITH a repair hint appended to the prompt. A response that
+ * legitimately parses (including `[]` = nothing conflicts, or an all-store
+ * list) IS a judgment and is NOT retried. If the retry also fails we fall
+ * back to store-all (dedup skipped) rather than losing the memory.
+ */
+const LLM_RETRY_LIMIT = 1;
+
+/** Appended to the user prompt on a retry, steering the model back to pure JSON. */
+const RETRY_REPAIR_HINT =
+  "\n\n[SYSTEM] Your previous reply was empty or not valid JSON, so it could not be " +
+  "parsed. Return ONLY a single valid JSON array matching the requested schema " +
+  "(array of {record_id, action, target_ids, merged_content, merged_type, " +
+  "merged_priority, merged_timestamps}), with no markdown fences, no prose, " +
+  "and no trailing text.";
+
 // ============================
 // Core function (batch mode)
 // ============================
@@ -137,6 +157,12 @@ export async function batchDedup(params: {
 
 /**
  * Phase 2: Run batch LLM judgment on candidate matches.
+ *
+ * Retry policy (mirrors l1-extractor): empty or unparseable responses are
+ * transport/serve flakes, not judgments — retried once with a repair hint
+ * appended to the prompt. A response that parses (including an all-store
+ * list or `[]`) is a judgment and is not retried. If the retry also fails,
+ * fall back to store-all: dedup is skipped but no memory is lost.
  */
 async function runLlmJudgment(
   matches: CandidateMatch[],
@@ -148,47 +174,64 @@ async function runLlmJudgment(
 ): Promise<DedupDecision[]> {
   logger?.debug?.(`${TAG} Running batch conflict detection for ${memories.length} memories`);
 
-  try {
-    const userPrompt = formatBatchConflictPrompt(matches);
-    let result: string;
+  for (let attempt = 1; attempt <= 1 + LLM_RETRY_LIMIT; attempt++) {
+    try {
+      const userPrompt =
+        formatBatchConflictPrompt(matches) + (attempt > 1 ? RETRY_REPAIR_HINT : "");
+      let result: string;
 
-    if (llmRunner) {
-      // Use the host-neutral LLMRunner interface
-      result = await llmRunner.run({
-        prompt: userPrompt,
-        systemPrompt: CONFLICT_DETECTION_SYSTEM_PROMPT,
-        taskId: "l1-conflict-detection",
-        timeoutMs: 180_000,
-      });
-    } else {
-      // Fallback: create CleanContextRunner (OpenClaw path)
-      const runner = new CleanContextRunner({
-        config,
-        modelRef: model,
-        enableTools: false,
-        logger,
-      });
+      if (llmRunner) {
+        // Use the host-neutral LLMRunner interface
+        result = await llmRunner.run({
+          prompt: userPrompt,
+          systemPrompt: CONFLICT_DETECTION_SYSTEM_PROMPT,
+          taskId: "l1-conflict-detection",
+          timeoutMs: 180_000,
+        });
+      } else {
+        // Fallback: create CleanContextRunner (OpenClaw path)
+        const runner = new CleanContextRunner({
+          config,
+          modelRef: model,
+          enableTools: false,
+          logger,
+        });
 
-      result = await runner.run({
-        prompt: userPrompt,
-        systemPrompt: CONFLICT_DETECTION_SYSTEM_PROMPT,
-        taskId: "l1-conflict-detection",
-        timeoutMs: 180_000,
-      });
+        result = await runner.run({
+          prompt: userPrompt,
+          systemPrompt: CONFLICT_DETECTION_SYSTEM_PROMPT,
+          taskId: "l1-conflict-detection",
+          timeoutMs: 180_000,
+        });
+      }
+
+      // null = structurally unparseable (empty, no array, bad JSON) → retry.
+      // A parsed result (even all-store) is a judgment → return it.
+      const decisions = parseBatchResult(result, memories, logger);
+      if (decisions !== null) {
+        return decisions;
+      }
+
+      if (attempt <= LLM_RETRY_LIMIT) {
+        logger?.info?.(
+          `${TAG} Empty or unparseable conflict-detection response (attempt ${attempt}/${1 + LLM_RETRY_LIMIT}, rawLen=${result.length}) — retrying with repair hint.`,
+        );
+        await new Promise((r) => setTimeout(r, 2_000 * attempt));
+      } else {
+        logger?.warn?.(
+          `${TAG} Conflict detection unparseable after ${attempt} attempts (rawLen=${result.length}) — defaulting all to store.`,
+        );
+        return fallbackStoreAll(memories);
+      }
+    } catch (err) {
+      logger?.warn?.(
+        `${TAG} Batch conflict detection failed, defaulting all to store: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return fallbackStoreAll(memories);
     }
-
-    const decisions = parseBatchResult(result, memories, logger);
-    return decisions;
-  } catch (err) {
-    logger?.warn?.(
-      `${TAG} Batch conflict detection failed, defaulting all to store: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return memories.map((m) => ({
-      record_id: m.record_id,
-      action: "store" as const,
-      target_ids: [],
-    }));
   }
+
+  return fallbackStoreAll(memories);
 }
 
 // ============================
@@ -306,12 +349,17 @@ const VALID_TYPES: MemoryType[] = ["persona", "episodic", "instruction"];
  * Parse the LLM's batch conflict detection JSON response.
  *
  * Expected format: [{record_id, action, target_ids, merged_content, merged_type, merged_priority, merged_timestamps}]
+ *
+ * Returns `null` when the response is structurally unparseable (empty,
+ * prose-only, non-array, or malformed JSON) — the caller retries once with
+ * a repair hint. A parsed result, including an all-store list or `[]`, is a
+ * judgment and is returned as-is.
  */
 function parseBatchResult(
   raw: string,
   memories: Array<ExtractedMemory & { record_id: string }>,
   logger?: Logger,
-): DedupDecision[] {
+): DedupDecision[] | null {
   try {
     // Strip markdown code block wrappers
     let cleaned = raw.trim();
@@ -322,8 +370,10 @@ function parseBatchResult(
     // Extract JSON array
     const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
     if (!arrayMatch) {
-      logger?.warn?.(`${TAG} No JSON array found in conflict detection response`);
-      return fallbackStoreAll(memories);
+      // Structurally unparseable (empty or prose-only) — NOT a judgment.
+      // Return null so the caller can retry once with a repair hint.
+      logger?.debug?.(`${TAG} No JSON array found in conflict detection response (rawLen=${cleaned.length})`);
+      return null;
     }
 
     // Sanitize control characters inside JSON string literals that LLM may produce
@@ -331,8 +381,8 @@ function parseBatchResult(
     const parsed = JSON.parse(sanitized) as unknown[];
 
     if (!Array.isArray(parsed)) {
-      logger?.warn?.(`${TAG} Conflict detection response is not an array`);
-      return fallbackStoreAll(memories);
+      logger?.debug?.(`${TAG} Conflict detection response is not an array (rawLen=${cleaned.length})`);
+      return null;
     }
 
     // Build decisions from LLM output
@@ -381,8 +431,10 @@ function parseBatchResult(
 
     return decisions;
   } catch (err) {
-    logger?.warn?.(`${TAG} Failed to parse conflict detection result: ${err instanceof Error ? err.message : String(err)}`);
-    return fallbackStoreAll(memories);
+    // Malformed JSON — NOT a judgment. Return null so the caller can retry
+    // once with a repair hint. Raw payload is logged for diagnosis.
+    logger?.debug?.(`${TAG} Failed to parse conflict detection result: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
   }
 }
 
