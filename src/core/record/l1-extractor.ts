@@ -151,7 +151,7 @@ export async function extractL1Memories(params: {
   // Step 1: LLM extraction (scene segmentation + memory extraction)
   let scenes: SceneSegment[];
   try {
-    scenes = await callLlmExtraction({
+    scenes = await callLlmExtractionWithRetry({
       newMessages,
       backgroundMessages,
       previousSceneName: options.previousSceneName,
@@ -293,7 +293,7 @@ export async function extractL1Memories(params: {
 /**
  * Call LLM to extract scene-segmented memories from conversation messages.
  */
-async function callLlmExtraction(params: {
+async function callLlmExtractionOnce(params: {
   newMessages: ConversationMessage[];
   backgroundMessages: ConversationMessage[];
   previousSceneName?: string;
@@ -346,6 +346,65 @@ async function callLlmExtraction(params: {
   return parseExtractionResult(result, logger);
 }
 
+const LLM_EMPTY_RETRY_LIMIT = 1;
+
+/**
+ * LLM extraction with empty-response retry.
+ *
+ * deepseek-v4-flash intermittently returns an EMPTY string to the extraction
+ * prompt (observed ~100x over a month of logs: `NO_JSON ... rawLen=0`). The
+ * old path treated that as "nothing memorable", advanced the cursor, and the
+ * batch's memories were silently lost. An empty response is a TRANSPORT/serve
+ * flake, not a judgment — retry it. A non-empty response that legitimately
+ * parses to `[]` (the LLM found nothing worth extracting) is NOT retried.
+ */
+async function callLlmExtractionWithRetry(params: {
+  newMessages: ConversationMessage[];
+  backgroundMessages: ConversationMessage[];
+  previousSceneName?: string;
+  config: unknown;
+  logger?: Logger;
+  model?: string;
+  llmRunner?: LLMRunner;
+}): Promise<SceneSegment[]> {
+  const { logger } = params;
+
+  for (let attempt = 1; attempt <= 1 + LLM_EMPTY_RETRY_LIMIT; attempt++) {
+    const result = await callLlmExtractionOnce(params);
+    const cleaned = result.trim();
+    const stripped = cleaned
+      .replace(/^```(?:json)?\s*\n?/, "")
+      .replace(/\n?```\s*$/, "")
+      .trim();
+
+    // Genuinely-empty extraction: the LLM answered with a valid empty array —
+    // a judgment, not a failure. No retry.
+    if (/^\[\s*\]$/.test(stripped)) {
+      return [];
+    }
+
+    // Empty or unparseable response — transient serve flake. Retry.
+    if (cleaned.length === 0 || !cleaned.includes("[")) {
+      if (attempt <= LLM_EMPTY_RETRY_LIMIT) {
+        logger?.info?.(
+          `${TAG} Empty extraction response (attempt ${attempt}/${1 + LLM_EMPTY_RETRY_LIMIT}, len=${cleaned.length}) — retrying. ` +
+            `(If retries fail, the pipeline re-presents this batch on later cycles.)`,
+        );
+        await new Promise((r) => setTimeout(r, 2_000 * attempt));
+        continue;
+      }
+      logger?.info?.(
+        `${TAG} Extraction empty after ${attempt} attempts — deferring. The pipeline ` +
+          `re-presents this batch on later cycles, so nothing is lost.`,
+      );
+    }
+
+    return parseExtractionResult(result, logger);
+  }
+
+  return []; // unreachable
+}
+
 /**
  * Parse the LLM's JSON response into SceneSegment array.
  * Expected format: [{scene_name, message_ids, memories: [...]}]
@@ -361,10 +420,13 @@ function parseExtractionResult(raw: string, logger?: Logger): SceneSegment[] {
     // Try to extract JSON array
     const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
     if (!arrayMatch) {
-      logger?.warn?.(`${TAG} No JSON array found in extraction response`);
-      // [l1-debug] NO_JSON — dump the full raw so we can see what the LLM actually said
+      // Self-healing: an empty/unparseable response is retried here and the
+      // pipeline re-presents the batch on later cycles — informational, not
+      // an alarm. Kept visible (info) because persistent occurrences would
+      // still deserve attention.
+      logger?.info?.(`${TAG} No JSON array found in extraction response (batch will be re-attempted)`);
       const rawPreview = raw.slice(0, 2048);
-      logger?.warn?.(
+      logger?.info?.(
         `${TAG} [l1-debug] NO_JSON taskId=l1-extraction, rawLen=${raw.length}, cleanedLen=${cleaned.length}, rawFull=${JSON.stringify(rawPreview)}${raw.length > 2048 ? `…(+${raw.length - 2048})` : ""}`,
       );
       return [];
