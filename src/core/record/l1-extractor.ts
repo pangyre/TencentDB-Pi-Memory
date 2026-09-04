@@ -302,7 +302,7 @@ async function callLlmExtractionOnce(params: {
   model?: string;
   /** Host-neutral LLM runner — when provided, used instead of CleanContextRunner. */
   llmRunner?: LLMRunner;
-}): Promise<SceneSegment[]> {
+}): Promise<string> {
   const { newMessages, backgroundMessages, previousSceneName, config, logger, model, llmRunner } = params;
 
   const userPrompt = formatExtractionPrompt({
@@ -343,7 +343,7 @@ async function callLlmExtractionOnce(params: {
     });
   }
 
-  return parseExtractionResult(result, logger);
+  return result;
 }
 
 const LLM_EMPTY_RETRY_LIMIT = 1;
