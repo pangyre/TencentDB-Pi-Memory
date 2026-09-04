@@ -8,7 +8,8 @@
  *
  * Strategies:
  * - `"vllm"`:      vLLM / SGLang — `chat_template_kwargs.enable_thinking = false`
- * - `"deepseek"`:  DeepSeek official API — top-level `enable_thinking: false`
+ * - `"deepseek"`:  DeepSeek official API — nested `thinking.type="disabled"`
+ *   (top-level `enable_thinking: false` is NOT honored by the reasoning models)
  * - `"dashscope"`: Alibaba DashScope (Qwen) — top-level `enable_thinking: false`
  * - `"openai"`:    OpenAI o-series — `reasoning_effort: "low"` (cannot fully disable)
  * - `"anthropic"`: Anthropic Claude — `thinking: { type: "disabled" }`
@@ -69,7 +70,13 @@ function applyVllm(body: Record<string, unknown>): void {
 }
 
 function applyDeepSeek(body: Record<string, unknown>): void {
-  body.enable_thinking = false;
+  // DeepSeek's reasoning models ignore the top-level `enable_thinking: false`
+  // flag (verified 2026-09-04: deepseek-v4-flash still emits reasoning_content
+  // and reasoning_tokens with it set). The nested `thinking.type="disabled"`
+  // form is honored — reasoning stops, latency drops from ~60s to ~1s, and the
+  // maxOutputTokens budget stops being starved by the reasoning pass (which
+  // otherwise returns finish_reason="length" with EMPTY content on big prompts).
+  body.thinking = { type: "disabled" };
 }
 
 function applyDashScope(body: Record<string, unknown>): void {

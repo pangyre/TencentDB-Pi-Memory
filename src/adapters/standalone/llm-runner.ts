@@ -227,8 +227,31 @@ export class StandaloneLLMRunner implements LLMRunner {
       const totalMs = Date.now() - runStartMs;
 
       this.logger?.debug?.(
-        `${TAG} run() completed: ${totalMs}ms, steps=${result.steps.length}, output=${text.length} chars`,
+        `${TAG} run() completed: ${totalMs}ms, steps=${result.steps.length}, output=${text.length} chars, finishReason=${result.finishReason}`,
       );
+
+      // Empty output is a serve/transport flake signature (see l1-dedup
+      // retry policy): a reasoning model can exhaust maxOutputTokens inside
+      // the reasoning pass and return finishReason="length" with zero content.
+      // Dump the raw result shape so the failure is diagnosable — the model
+      // name, finish reason, step/part structure, and reasoning-vs-content
+      // token split all live here and are otherwise invisible in the warn log.
+      if (text.length === 0) {
+        try {
+          const summary = {
+            finishReason: result.finishReason,
+            steps: result.steps.length,
+            stepPartKinds: result.steps.map((s) =>
+              (s.parts ?? []).map((p: { type?: string }) => p.type ?? "unknown"),
+            ),
+            usage: (result as unknown as { usage?: Record<string, unknown> }).usage ?? null,
+            model: this.model,
+          };
+          this.logger?.warn?.(`${TAG} [l1-debug] EMPTY_DUMP taskId=${params.taskId}, summary=${JSON.stringify(summary)}`);
+        } catch (dumpErr) {
+          this.logger?.warn?.(`${TAG} [l1-debug] EMPTY_DUMP taskId=${params.taskId}, dumpFailed=${dumpErr instanceof Error ? dumpErr.message : String(dumpErr)}`);
+        }
+      }
 
       // Log tool usage if any
       if (result.steps.length > 1) {
@@ -247,8 +270,8 @@ export class StandaloneLLMRunner implements LLMRunner {
           inputLength: params.prompt.length,
           outputLength: text.length,
           totalDurationMs: totalMs,
-          success: true,
-          error: null,
+          success: text.length > 0,
+          error: text.length === 0 ? `empty_output finish=${result.finishReason}` : null,
         });
       }
 

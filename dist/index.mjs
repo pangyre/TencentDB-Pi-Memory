@@ -59,7 +59,7 @@ function applyVllm(body) {
 	};
 }
 function applyDeepSeek(body) {
-	body.enable_thinking = false;
+	body.thinking = { type: "disabled" };
 }
 function applyDashScope(body) {
 	body.enable_thinking = false;
@@ -16905,7 +16905,19 @@ var StandaloneLLMRunner = class {
 			});
 			const text = result.text.trim();
 			const totalMs = Date.now() - runStartMs;
-			this.logger?.debug?.(`${TAG$8} run() completed: ${totalMs}ms, steps=${result.steps.length}, output=${text.length} chars`);
+			this.logger?.debug?.(`${TAG$8} run() completed: ${totalMs}ms, steps=${result.steps.length}, output=${text.length} chars, finishReason=${result.finishReason}`);
+			if (text.length === 0) try {
+				const summary = {
+					finishReason: result.finishReason,
+					steps: result.steps.length,
+					stepPartKinds: result.steps.map((s) => (s.parts ?? []).map((p) => p.type ?? "unknown")),
+					usage: result.usage ?? null,
+					model: this.model
+				};
+				this.logger?.warn?.(`${TAG$8} [l1-debug] EMPTY_DUMP taskId=${params.taskId}, summary=${JSON.stringify(summary)}`);
+			} catch (dumpErr) {
+				this.logger?.warn?.(`${TAG$8} [l1-debug] EMPTY_DUMP taskId=${params.taskId}, dumpFailed=${dumpErr instanceof Error ? dumpErr.message : String(dumpErr)}`);
+			}
 			if (result.steps.length > 1) {
 				const toolCalls = result.steps.flatMap((s) => s.toolCalls ?? []);
 				this.logger?.debug?.(`${TAG$8} Tool calls: ${toolCalls.map((tc) => tc.toolName).join(", ")}`);
@@ -16917,8 +16929,8 @@ var StandaloneLLMRunner = class {
 				inputLength: params.prompt.length,
 				outputLength: text.length,
 				totalDurationMs: totalMs,
-				success: true,
-				error: null
+				success: text.length > 0,
+				error: text.length === 0 ? `empty_output finish=${result.finishReason}` : null
 			});
 			return text;
 		} catch (err) {
