@@ -12,6 +12,8 @@ export interface SceneIndexEntry {
   heat: number;
   created: string;
   updated: string;
+  /** Project scope tag (see SceneBlockMeta.project). Absent = visible everywhere. */
+  project?: string;
 }
 
 /**
@@ -40,6 +42,7 @@ export async function readSceneIndex(dataDir: string): Promise<SceneIndexEntry[]
         heat: typeof item.heat === "number" ? item.heat : 0,
         created: typeof item.created === "string" ? item.created : "",
         updated: typeof item.updated === "string" ? item.updated : "",
+        project: typeof item.project === "string" && item.project ? item.project : undefined,
       });
     }
     return entries;
@@ -83,6 +86,7 @@ export async function syncSceneIndex(dataDir: string): Promise<SceneIndexEntry[]
         heat: block.meta.heat,
         created: block.meta.created,
         updated: block.meta.updated,
+        project: block.meta.project,
       });
     } catch {
       // File may have been deleted between readdir and readFile (e.g. by concurrent

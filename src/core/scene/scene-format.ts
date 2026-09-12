@@ -7,6 +7,10 @@ export interface SceneBlockMeta {
   updated: string;
   summary: string;
   heat: number;
+  /** Project scope tag. Empty/absent = visible everywhere; "global" = explicit everywhere;
+   *  otherwise the project's agentId (cwd-derived, e.g. "tuesday", "k0", "karma-come-lately").
+   *  Added 2026-09-06 (rules audit §7 A.5) for per-project scene-navigation scoping. */
+  project?: string;
 }
 
 export interface SceneBlock {
@@ -42,6 +46,7 @@ export function parseSceneBlock(raw: string, filename: string): SceneBlock {
     updated: extractMetaField(metaBlock, "updated"),
     summary: extractMetaField(metaBlock, "summary"),
     heat: parseInt(extractMetaField(metaBlock, "heat"), 10) || 0,
+    project: extractMetaField(metaBlock, "project") || undefined,
   };
 
   return { filename, meta, content };
@@ -58,14 +63,16 @@ export function formatSceneBlock(meta: SceneBlockMeta, content: string): string 
  * Format the META section.
  */
 export function formatMeta(meta: SceneBlockMeta): string {
-  return [
+  const lines = [
     META_START,
     `created: ${meta.created}`,
     `updated: ${meta.updated}`,
     `summary: ${meta.summary}`,
     `heat: ${meta.heat}`,
-    META_END,
-  ].join("\n");
+  ];
+  if (meta.project) lines.push(`project: ${meta.project}`);
+  lines.push(META_END);
+  return lines.join("\n");
 }
 
 function extractMetaField(metaBlock: string, field: string): string {

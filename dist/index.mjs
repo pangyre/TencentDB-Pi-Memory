@@ -246,6 +246,7 @@ function parseConfig(raw) {
 			maxTotalRecallChars: num(recallGroup, "maxTotalRecallChars") ?? 0,
 			scoreThreshold: num(recallGroup, "scoreThreshold") ?? .3,
 			strategy: validateStrategy(str(recallGroup, "strategy")) ?? "hybrid",
+			scopeL1: str(recallGroup, "scopeL1") === "agent" ? "agent" : "all",
 			timeoutMs: num(recallGroup, "timeoutMs") ?? 5e3
 		},
 		embedding: {
@@ -14962,7 +14963,8 @@ function parseSceneBlock(raw, filename) {
 			created: extractMetaField(metaBlock, "created"),
 			updated: extractMetaField(metaBlock, "updated"),
 			summary: extractMetaField(metaBlock, "summary"),
-			heat: parseInt(extractMetaField(metaBlock, "heat"), 10) || 0
+			heat: parseInt(extractMetaField(metaBlock, "heat"), 10) || 0,
+			project: extractMetaField(metaBlock, "project") || void 0
 		},
 		content
 	};
@@ -14999,7 +15001,8 @@ async function readSceneIndex(dataDir) {
 				summary: typeof item.summary === "string" ? item.summary : "",
 				heat: typeof item.heat === "number" ? item.heat : 0,
 				created: typeof item.created === "string" ? item.created : "",
-				updated: typeof item.updated === "string" ? item.updated : ""
+				updated: typeof item.updated === "string" ? item.updated : "",
+				project: typeof item.project === "string" && item.project ? item.project : void 0
 			});
 		}
 		return entries;
@@ -15034,7 +15037,8 @@ async function syncSceneIndex(dataDir) {
 			summary: block.meta.summary,
 			heat: block.meta.heat,
 			created: block.meta.created,
-			updated: block.meta.updated
+			updated: block.meta.updated,
+			project: block.meta.project
 		});
 	} catch {
 		continue;
@@ -17584,6 +17588,35 @@ const RECALL_TRUNCATION_SUFFIX = "…（已截断；可用 tdai_memory_search �
 const MIN_TRUNCATED_RECALL_LINE_CHARS = 40;
 const RECALL_LINE_SEPARATOR = "\n";
 /**
+* Derive the project agentId from a session key (`pi:<agentId>:<sessionId>`).
+* Returns undefined for keys that do not carry an agentId — no scoping is applied.
+*/
+function deriveAgentIdFromSessionKey(sessionKey) {
+	if (!sessionKey || !sessionKey.startsWith("pi:")) return void 0;
+	const rest = sessionKey.slice(3);
+	const idx = rest.indexOf(":");
+	return (idx === -1 ? rest : rest.slice(0, idx)) || void 0;
+}
+/**
+* True when a record written under `recordSessionKey` is visible to `agentId`.
+* Unknown/unparseable keys stay visible — safe default so canon never silently
+* disappears (see docs/rules-prompt-audit-2026-09-06.md §7 A.5).
+*/
+function recordVisibleToAgent(recordSessionKey, agentId) {
+	if (!agentId) return true;
+	if (!recordSessionKey || !recordSessionKey.startsWith("pi:")) return true;
+	return recordSessionKey === `pi:${agentId}` || recordSessionKey.startsWith(`pi:${agentId}:`);
+}
+/**
+* True when a scene entry is visible to `agentId`. Untagged entries and
+* "global" entries are visible everywhere.
+*/
+function sceneVisibleToAgent(project, agentId) {
+	if (!agentId) return true;
+	if (!project) return true;
+	return project === "global" || project === agentId;
+}
+/**
 * Memory tools usage guide — injected at the end of memory context so the
 * main agent knows how to actively retrieve deeper information.
 */
@@ -17615,8 +17648,11 @@ async function performAutoRecall(params) {
 	})]);
 }
 async function performAutoRecallInner(params) {
-	const { userText, cfg, pluginDataDir, logger, vectorStore, embeddingService } = params;
+	const { userText, cfg, pluginDataDir, logger, vectorStore, embeddingService, sessionKey } = params;
 	const tRecallStart = performance.now();
+	const agentId = deriveAgentIdFromSessionKey(sessionKey);
+	const isMetaAgent = agentId === "tuesday";
+	const l1AgentScope = cfg.recall.scopeL1 === "agent" ? agentId : void 0;
 	const tSearchStart = performance.now();
 	let memoryLines = [];
 	let effectiveStrategy = "skipped";
@@ -17630,7 +17666,7 @@ async function performAutoRecallInner(params) {
 	if (!userText || userText.length === 0) logger?.debug?.(`${TAG$4} User text empty/undefined, skipping memory search (persona/scene still injected)`);
 	else {
 		effectiveStrategy = cfg.recall.strategy ?? "hybrid";
-		const searchResult = await searchMemories(userText, pluginDataDir, cfg, logger, effectiveStrategy, vectorStore, embeddingService);
+		const searchResult = await searchMemories(userText, pluginDataDir, cfg, logger, effectiveStrategy, vectorStore, embeddingService, l1AgentScope);
 		memoryLines = searchResult.lines;
 		searchTiming = searchResult.timing;
 		memoryLines = applyRecallBudget(memoryLines, cfg.recall, logger);
@@ -17666,7 +17702,7 @@ async function performAutoRecallInner(params) {
 	const tSceneStart = performance.now();
 	let sceneNavigation;
 	try {
-		const sceneIndex = await readSceneIndex(pluginDataDir);
+		const sceneIndex = (await readSceneIndex(pluginDataDir)).filter((e) => isMetaAgent || sceneVisibleToAgent(e.project, agentId));
 		if (sceneIndex.length > 0) {
 			sceneNavigation = generateSceneNavigation(sceneIndex, pluginDataDir);
 			logger?.debug?.(`${TAG$4} Scene navigation generated: ${sceneIndex.length} scenes`);
@@ -17708,7 +17744,7 @@ async function performAutoRecallInner(params) {
 *
 * Falls back to keyword if embedding resources are unavailable.
 */
-async function searchMemories(userText, pluginDataDir, cfg, logger, strategy, vectorStore, embeddingService) {
+async function searchMemories(userText, pluginDataDir, cfg, logger, strategy, vectorStore, embeddingService, agentScope) {
 	const emptyResult = {
 		lines: [],
 		timing: {
@@ -17738,7 +17774,7 @@ async function searchMemories(userText, pluginDataDir, cfg, logger, strategy, ve
 	try {
 		if (effectiveStrategy === "keyword") {
 			const tFts = performance.now();
-			const lines = await searchByKeyword(cleanText, pluginDataDir, maxResults, threshold, logger, vectorStore);
+			const lines = await searchByKeyword(cleanText, pluginDataDir, maxResults, threshold, logger, vectorStore, agentScope);
 			return {
 				lines,
 				timing: {
@@ -17751,7 +17787,7 @@ async function searchMemories(userText, pluginDataDir, cfg, logger, strategy, ve
 		}
 		if (effectiveStrategy === "embedding") {
 			const tEmb = performance.now();
-			const lines = await searchByEmbedding(cleanText, maxResults, threshold, vectorStore, embeddingService, logger, embeddingCallOpts);
+			const lines = await searchByEmbedding(cleanText, maxResults, threshold, vectorStore, embeddingService, logger, embeddingCallOpts, agentScope);
 			return {
 				lines,
 				timing: {
@@ -17768,30 +17804,33 @@ async function searchMemories(userText, pluginDataDir, cfg, logger, strategy, ve
 				query: cleanText,
 				topK: maxResults
 			});
+			const scoped = agentScope ? results.filter((r) => recordVisibleToAgent(r.session_key, agentScope)) : results;
 			const nativeMs = performance.now() - tNative;
 			logger?.debug?.(`${TAG$4} [hybrid-native] Single-call hybrid: ${results.length} results in ${nativeMs.toFixed(0)}ms`);
+			const lines = scoped.map((r) => formatMemoryLine(vectorResultToFormatable(r)));
 			return {
-				lines: results.map((r) => formatMemoryLine(vectorResultToFormatable(r))),
+				lines,
 				timing: {
 					ftsMs: 0,
 					embeddingMs: nativeMs,
 					ftsHits: 0,
-					embeddingHits: results.length
+					embeddingHits: lines.length
 				}
 			};
 		}
-		return await searchHybrid(cleanText, pluginDataDir, maxResults, threshold, vectorStore, embeddingService, logger, embeddingCallOpts);
+		return await searchHybrid(cleanText, pluginDataDir, maxResults, threshold, vectorStore, embeddingService, logger, embeddingCallOpts, agentScope);
 	} catch (err) {
 		logger?.warn?.(`${TAG$4} Memory search failed (strategy=${effectiveStrategy}): ${err instanceof Error ? err.message : String(err)}`);
 		return emptyResult;
 	}
 }
-async function searchByKeyword(userText, _pluginDataDir, maxResults, threshold, logger, vectorStore) {
+async function searchByKeyword(userText, _pluginDataDir, maxResults, threshold, logger, vectorStore, agentScope) {
 	if (vectorStore?.isFtsAvailable()) {
 		const ftsQuery = buildFtsQuery(userText);
 		if (ftsQuery) {
 			logger?.debug?.(`${TAG$4} [keyword-fts] Using FTS5 BM25 search: query="${ftsQuery}"`);
-			const ftsResults = await vectorStore.searchL1Fts(ftsQuery, maxResults * 2);
+			const allResults = await vectorStore.searchL1Fts(ftsQuery, maxResults * 2);
+			const ftsResults = agentScope ? allResults.filter((r) => recordVisibleToAgent(r.session_key, agentScope)) : allResults;
 			if (ftsResults.length > 0) {
 				logger?.debug?.(`${TAG$4} [keyword-fts] FTS5 raw results (${ftsResults.length}): ` + ftsResults.map((r) => `id=${r.record_id} score=${r.score.toFixed(6)}`).join(", "));
 				const filtered = ftsResults.filter((r) => r.score >= threshold).slice(0, maxResults);
@@ -17810,11 +17849,12 @@ async function searchByKeyword(userText, _pluginDataDir, maxResults, threshold, 
 	logger?.debug?.(`${TAG$4} [keyword] FTS5 unavailable or no results, skipping keyword search`);
 	return [];
 }
-async function searchByEmbedding(userText, maxResults, threshold, vectorStore, embeddingService, logger, embeddingCallOpts) {
+async function searchByEmbedding(userText, maxResults, threshold, vectorStore, embeddingService, logger, embeddingCallOpts, agentScope) {
 	logger?.debug?.(`${TAG$4} [embedding-search] START query="${userText.slice(0, 80)}...", maxResults=${maxResults}, threshold=${threshold}`);
 	const queryEmbedding = await embeddingService.embed(userText, embeddingCallOpts);
 	logger?.debug?.(`${TAG$4} [embedding-search] Query embedding OK: dims=${queryEmbedding.length}, norm=${Math.sqrt(Array.from(queryEmbedding).reduce((s, v) => s + v * v, 0)).toFixed(4)}, searching top-${maxResults * 2}...`);
-	const vecResults = await vectorStore.searchL1Vector(queryEmbedding, maxResults * 2);
+	const allVecResults = await vectorStore.searchL1Vector(queryEmbedding, maxResults * 2);
+	const vecResults = agentScope ? allVecResults.filter((r) => recordVisibleToAgent(r.session_key, agentScope)) : allVecResults;
 	if (vecResults.length === 0) {
 		logger?.debug?.(`${TAG$4} [embedding-search] Returned 0 results`);
 		return [];
@@ -17839,7 +17879,7 @@ async function searchByEmbedding(userText, maxResults, threshold, vectorStore, e
 * If FTS5 is unavailable, the keyword side returns empty and RRF uses
 * embedding results only.
 */
-async function searchHybrid(userText, _pluginDataDir, maxResults, _threshold, vectorStore, embeddingService, logger, embeddingCallOpts) {
+async function searchHybrid(userText, _pluginDataDir, maxResults, _threshold, vectorStore, embeddingService, logger, embeddingCallOpts, agentScope) {
 	const candidateK = maxResults * 3;
 	const [keywordResult, embeddingResult] = await Promise.all([(async () => {
 		const tStart = performance.now();
@@ -17851,7 +17891,7 @@ async function searchHybrid(userText, _pluginDataDir, maxResults, _threshold, ve
 					if (ftsResults.length > 0) {
 						logger?.debug?.(`${TAG$4} [hybrid-keyword-fts] FTS5 found ${ftsResults.length} candidates`);
 						return {
-							records: ftsResults.map((r) => ({
+							records: ftsResults.filter((r) => recordVisibleToAgent(r.session_key, agentScope)).map((r) => ({
 								record: {
 									id: r.record_id,
 									content: r.content,
@@ -17897,7 +17937,8 @@ async function searchHybrid(userText, _pluginDataDir, maxResults, _threshold, ve
 			logger?.debug?.(`${TAG$4} [hybrid-embedding] Generating query embedding...`);
 			const queryEmbedding = await embeddingService.embed(userText, embeddingCallOpts);
 			logger?.debug?.(`${TAG$4} [hybrid-embedding] Embedding OK, dims=${queryEmbedding.length}, searching top-${candidateK}...`);
-			const results = await vectorStore.searchL1Vector(queryEmbedding, candidateK, userText);
+			const allResults = await vectorStore.searchL1Vector(queryEmbedding, candidateK, userText);
+			const results = agentScope ? allResults.filter((r) => recordVisibleToAgent(r.session_key, agentScope)) : allResults;
 			logger?.debug?.(`${TAG$4} [hybrid-embedding] Got ${results.length} candidates`);
 			return {
 				results,

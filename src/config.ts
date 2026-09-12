@@ -93,6 +93,11 @@ export interface RecallConfig {
   strategy: "embedding" | "keyword" | "hybrid";
   /** Overall recall timeout in milliseconds (default: 5000). When exceeded, recall is skipped with a warning. */
   timeoutMs: number;
+  /** L1 recall scoping (default: "all"). "agent" filters recalled records to those written under the current
+   *  project's agentId (session keys are `pi:<agentId>:<sessionId>`). Default "all" because cross-project canon
+   *  (e.g. story canon written from a meta-agent session) must stay visible everywhere — see
+   *  docs/rules-prompt-audit-2026-09-06.md §7 A.5. Scene navigation is scoped separately by scene project tags. */
+  scopeL1: "all" | "agent";
 }
 
 /** Embedding service configuration for vector search. */
@@ -554,6 +559,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       maxTotalRecallChars: num(recallGroup, "maxTotalRecallChars") ?? 0,
       scoreThreshold: num(recallGroup, "scoreThreshold") ?? 0.3,
       strategy: validateStrategy(str(recallGroup, "strategy")) ?? "hybrid",
+      scopeL1: (str(recallGroup, "scopeL1") === "agent" ? "agent" : "all"),
       timeoutMs: num(recallGroup, "timeoutMs") ?? 5000,
     },
     embedding: {
